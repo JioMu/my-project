@@ -47,6 +47,9 @@ from .views import (
 )
 from .views_config import EnvironmentConfigViewSet, AIIntelligentModeConfigViewSet
 from .pipeline_views import AppPipelineRunViewSet
+from . import apk_views
+from . import apk_context_views
+from . import ai_mode_config_views
 
 router = DefaultRouter()
 router.register(r'dashboard', UiDashboardViewSet, basename='dashboard')
@@ -110,6 +113,41 @@ urlpatterns = [
     path('llm-proxy/<path:rest>', llm_proxy, name='llm-proxy-rest'),
     # 导出 iOS 当前页面的可访问性元素树（排查「精确定位该填什么」）
     path('ios-dump-elements/', ios_dump_elements, name='ios-dump-elements'),
+
+    # ---- APK 智能回归（MVP：APK → REA 分析 → 人工确认 → Midscene → HTML 报告） ----
+    path('apk-regression/artifacts/upload/', apk_views.upload_apk, name='apk-upload'),
+    path('apk-regression/artifacts/', apk_views.artifact_list, name='apk-artifacts'),
+    path('apk-regression/artifacts/<int:pk>/', apk_views.artifact_detail, name='apk-artifact-detail'),
+    path('apk-regression/runs/', apk_views.run_list, name='apk-runs'),
+    path('apk-regression/runs/<int:pk>/', apk_views.run_detail, name='apk-run-detail'),
+    path('apk-regression/runs/<int:pk>/analyze/', apk_views.run_analyze, name='apk-run-analyze'),
+    path('apk-regression/runs/<int:pk>/approve/', apk_views.run_approve, name='apk-run-approve'),
+    path('apk-regression/runs/<int:pk>/execute/', apk_views.run_execute, name='apk-run-execute'),
+    path('apk-regression/runs/<int:pk>/abort/', apk_views.run_abort, name='apk-run-abort'),
+
+    # ---- 业务资料输入源（操作说明文档 / 项目知识库 / 人工补充） ----
+    path('apk-regression/projects/', apk_context_views.project_options,
+         name='apk-context-projects'),
+    path('apk-regression/projects/<int:pk>/knowledge/', apk_context_views.project_knowledge,
+         name='apk-context-knowledge'),
+    path('apk-regression/runs/<int:pk>/context/', apk_context_views.run_context,
+         name='apk-run-context'),
+    path('apk-regression/runs/<int:pk>/context/upload/', apk_context_views.upload_doc,
+         name='apk-context-upload'),
+    path('apk-regression/runs/<int:pk>/context/docs/<int:idx>/', apk_context_views.delete_doc,
+         name='apk-context-doc-delete'),
+    path('apk-regression/runs/<int:pk>/context/preview/', apk_context_views.context_preview,
+         name='apk-context-preview'),
+    path('apk-regression/runs/<int:pk>/yaml/', apk_views.run_yaml, name='apk-run-yaml'),
+    path('apk-regression/runs/<int:pk>/report/', apk_views.run_report, name='apk-run-report'),
+
+    # ---- AI 智能模式专属模型配置（独立表 ui_ai_mode_model_configs，与 AIModelConfig 互不影响） ----
+    path('ai-mode-models/roles/', ai_mode_config_views.role_meta, name='ai-mode-model-roles'),
+    path('ai-mode-models/active/', ai_mode_config_views.active_configs, name='ai-mode-model-active'),
+    path('ai-mode-models/test/', ai_mode_config_views.test_unsaved, name='ai-mode-model-test'),
+    path('ai-mode-models/', ai_mode_config_views.config_list, name='ai-mode-models'),
+    path('ai-mode-models/<int:pk>/', ai_mode_config_views.config_detail, name='ai-mode-model-detail'),
+    path('ai-mode-models/<int:pk>/test/', ai_mode_config_views.test_saved, name='ai-mode-model-test-saved'),
 ]
 
 # 添加媒体文件路由

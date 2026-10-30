@@ -151,6 +151,18 @@
             <el-card v-for="step in reportData.detailed_steps" :key="step.step_number" class="step-card">
               <div class="step-header">
                 <span class="step-number">步骤 {{ step.step_number }}</span>
+                <!-- 公共步骤来源标签：后端展开 {ref:'xxx'} 时会写 ref_name。
+                     不标出来的话，公共步骤会和用例自身步骤长得一模一样，
+                     用户会以为"多出来一条报告"。 -->
+                <el-tooltip
+                  v-if="step.ref_name"
+                  content="该步骤由「公共步骤」引用而来，内容取自业务动作库"
+                  placement="top"
+                >
+                  <el-tag type="info" size="small" effect="plain" class="step-ref-tag">
+                    公共步骤：{{ step.ref_group || step.ref_name }}
+                  </el-tag>
+                </el-tooltip>
                 <el-tag :type="getStepStatusType(step.status)" size="small">
                   {{ step.status }}
                 </el-tag>
@@ -815,14 +827,26 @@ const handleClose = () => {
 
 .step-header {
   display: flex;
-  justify-content: space-between;
+  /* 原来是 space-between：加了「公共步骤」标签后三个元素会被推到两端，
+     标签飘在中间很难看。改成 flex-start + gap，状态标签用 margin-left:auto 靠右。 */
+  justify-content: flex-start;
   align-items: center;
+  gap: 8px;
   margin-bottom: 10px;
+}
+
+.step-header > .el-tag:last-child {
+  margin-left: auto;
 }
 
 .step-number {
   font-weight: 600;
   color: #409EFF;
+}
+
+/* 公共步骤来源标签：与普通状态标签区分，用虚线边框弱化视觉权重 */
+.step-ref-tag {
+  border-style: dashed;
 }
 
 .step-content > div {

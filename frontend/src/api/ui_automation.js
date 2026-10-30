@@ -756,6 +756,14 @@ export function getTestCaseExecution(id) {
 }
 
 
+// 请求中止一条正在执行的记录（置信号，执行线程在步骤间停止）
+export function abortTestCaseExecution(id) {
+  return request({
+    url: `/ui-automation/test-case-executions/${id}/abort/`,
+    method: 'post'
+  })
+}
+
 // 删除测试用例执行记录
 export function deleteTestCaseExecution(id) {
   return request({
@@ -1098,10 +1106,13 @@ export function runAdhocAITask(data) {
 }
 
 // 停止 AI 任务
-export function stopAITask(id) {
+// force=true 会额外杀掉 midscene Node 进程 —— 唯一能让"卡在单步执行中"
+// 立刻返回的手段（Python 线程无法打断阻塞的 HTTP 调用）。
+export function stopAITask(id, force = false) {
   return request({
     url: `/ui-automation/ai-execution-records/${id}/stop/`,
-    method: 'post'
+    method: 'post',
+    data: { force }
   })
 }
 

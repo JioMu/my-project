@@ -259,6 +259,14 @@
               <el-icon><Monitor /></el-icon>
               <span>Midscene Web Playground</span>
             </el-menu-item>
+            <el-menu-item index="/ai-intelligent-mode/apk-regression">
+              <el-icon><Box /></el-icon>
+              <span>APK 智能回归</span>
+            </el-menu-item>
+            <el-menu-item index="/ai-intelligent-mode/model-config">
+              <el-icon><Setting /></el-icon>
+              <span>模型配置</span>
+            </el-menu-item>
             <el-menu-item index="/ai-intelligent-mode/execution-records">
               <el-icon><Timer /></el-icon>
               <span>AI 测试报告</span>
@@ -480,6 +488,8 @@ const breadcrumbTitle = computed(() => {
     '/ai-intelligent-mode/business-actions': '公共步骤库',
     '/ai-intelligent-mode/element-picker': '元素拾取器',
     '/ai-intelligent-mode/midscene-playground': 'Midscene Playground',
+    '/ai-intelligent-mode/apk-regression': 'APK 智能回归',
+    '/ai-intelligent-mode/model-config': '模型配置',
     '/ai-intelligent-mode/midscene-web-playground': 'Midscene Web Playground',
     '/ai-intelligent-mode/execution-records': 'AI 测试报告',
 

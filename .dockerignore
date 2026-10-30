@@ -31,3 +31,16 @@ tmp/
 /_*.py
 # 根目录临时输出（2026-10-14：_*.txt 诊断产物已累积 100+ 个，曾被 COPY 进生产镜像）
 /_*.txt
+# 根目录临时打包产物（2026-10-30：_*.tar 累积 40+ 个、单次上传构建上下文 1.3GB+，
+# docker build 卡在 "transferring context" 数分钟。这些 tar 全是同步用的中转文件，
+# 永远不该进镜像。）
+/_*.tar
+/_*.tmp.tar
+# 备份目录：`_db_backup` 21GB + `_backup_20261030` 2.8GB（整库 mysqldump），
+# 绝不能进镜像 —— 这是 2026-10-30 构建卡在 "transferring context 1.29GB+" 的真凶。
+/_backup_*/
+/_backup*/
+# 一次性诊断产物目录
+/_assets_dump/
+/_dist_assets_dump/
+/devimages/

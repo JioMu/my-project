@@ -29,7 +29,25 @@
             {{ getSerialNumber($index) }}
           </template>
         </el-table-column>
-        <el-table-column prop="case_name" label="用例名称" min-width="200" show-overflow-tooltip />
+        <el-table-column prop="case_name" label="用例名称" min-width="200" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span>{{ row.case_name }}</span>
+            <!-- 多设备并行批次标签：同一用例选了 N 台设备时，后端会为每台各建
+                 一条记录（这是设计如此，各有独立日志/截图/token）。
+                 旧实现只在日志里写批次信息，列表看不到 ⇒ 用户把 N 条记录当成
+                 "重复执行 / 输出两条报告"。这里标出「第 1/2 台 · 设备名」。 -->
+            <el-tooltip
+              v-if="row.batch_total > 1"
+              :content="`同一用例在 ${row.batch_total} 台设备上并行执行，这是第 ${row.batch_index} 条记录（各设备结果独立，不是重复执行）`"
+              placement="top"
+            >
+              <el-tag type="info" size="small" effect="plain" class="batch-tag">
+                并行 {{ row.batch_index }}/{{ row.batch_total }}
+              </el-tag>
+            </el-tooltip>
+            <span v-if="row.device_name" class="device-name">{{ row.device_name }}</span>
+          </template>
+        </el-table-column>
 
         <el-table-column prop="status" label="状态" width="120">
           <template #default="{ row }">
@@ -90,8 +108,18 @@
         </el-table-column>
         <el-table-column prop="start_time" label="开始时间" width="180" :formatter="formatDate" />
         <el-table-column prop="executed_by.username" label="执行人" width="120" />
-        <el-table-column label="操作" width="200" fixed="right">
+        <el-table-column label="操作" width="260" fixed="right">
           <template #default="{ row }">
+            <!-- 执行中才显示「停止执行」：跑完的任务没有可停的东西 -->
+            <el-button
+              v-if="row.status === 'running' || row.status === 'pending'"
+              size="small"
+              type="danger"
+              :loading="stoppingIds.includes(row.id)"
+              @click="stopExecution(row)"
+            >
+              停止执行
+            </el-button>
             <el-button size="small" @click="viewDetail(row)">
               查看详情
             </el-button>
@@ -194,7 +222,7 @@
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete } from '@element-plus/icons-vue'
-import { getAIExecutionRecords, batchDeleteAIExecutionRecords } from '@/api/ui_automation'
+import { getAIExecutionRecords, batchDeleteAIExecutionRecords, stopAITask } from '@/api/ui_automation'
 import AIExecutionReport from './AIExecutionReport.vue'
 
 const records = ref([])
@@ -207,6 +235,8 @@ const pagination = reactive({
 
 const showDetailDialog = ref(false)
 const currentRecord = ref(null)
+// 正在停止中的记录 id（按钮 loading 用），避免用户连点
+const stoppingIds = ref([])
 let pollTimer = null
 
 // token 数字可读化：1234 -> 1.2k，1234567 -> 1.2M
@@ -288,6 +318,49 @@ const handleSizeChange = () => {
 
 const handleCurrentChange = () => {
   loadRecords()
+}
+
+// 停止执行：区分「优雅停止」和「立即停止」两种力度。
+//
+// 为什么要给用户选：优雅停止只在**步骤之间**生效，而 midscene 单步 aiAct
+// 可能跑几分钟 —— 用户点了没反应会以为按钮坏了。立即停止会杀 Node 进程，
+// 能当场停住，但代价是下次执行要重新拉起引擎（慢几秒）。让用户自己权衡。
+const stopExecution = async (row) => {
+  let action
+  try {
+    action = await ElMessageBox.confirm(
+      '选择停止方式：<br><br>'
+      + '<b>停止</b>：等当前步骤跑完后停，不影响引擎，下次执行无需重连。<br>'
+      + '<b>立即停止</b>：强行终止执行进程（当前步骤会被打断），'
+      + '下次执行需重新拉起引擎（慢几秒）。<br><br>'
+      + '两种方式都会保留已完成的步骤结果。',
+      '停止执行',
+      {
+        dangerouslyUseHTMLString: true,
+        type: 'warning',
+        confirmButtonText: '立即停止',
+        cancelButtonText: '停止',
+        distinguishCancelAndClose: true,  // 这样才能区分"取消"和"关闭"
+      }
+    )
+  } catch (e) {
+    // confirm 被 reject：'cancel' = 点了「停止」，'close' = 关掉弹窗
+    if (e !== 'cancel') return
+    action = 'cancel'
+  }
+
+  const force = action === 'confirm'   // confirm=立即停止，cancel=优雅停止
+  stoppingIds.value = [...stoppingIds.value, row.id]
+  try {
+    const res = await stopAITask(row.id, force)
+    ElMessage.success(res?.data?.message || '已停止')
+    // 刷新列表拿真实状态（后端已把状态落成 failed）
+    await loadRecords()
+  } catch (e) {
+    ElMessage.error('停止失败: ' + (e?.response?.data?.message || e.message))
+  } finally {
+    stoppingIds.value = stoppingIds.value.filter((id) => id !== row.id)
+  }
 }
 
 const viewDetail = (row) => {
@@ -452,6 +525,18 @@ onUnmounted(() => {
   border-radius: 4px;
   padding: 20px;
   box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.1);
+}
+
+/* 多设备并行批次标签 + 设备名：两者都排在被测名称后面，弱化视觉权重 */
+.batch-tag {
+  margin-left: 6px;
+  border-style: dashed;
+}
+
+.device-name {
+  margin-left: 6px;
+  font-size: 12px;
+  color: #909399;
 }
 
 .pagination-container {

@@ -147,6 +147,16 @@
         <el-form-item label="结束日期" prop="end_date">
           <el-date-picker v-model="editForm.end_date" type="date" placeholder="选择日期" />
         </el-form-item>
+        <!-- 弹窗策略：项目级配一次长期有效（用例级还可单独覆盖） -->
+        <el-divider content-position="left">弹窗处理</el-divider>
+        <el-form-item label="自动处理">
+          <el-switch v-model="editForm.auto_dismiss_popup" />
+          <span class="form-hint">遇到权限/协议/广告弹窗时自动关闭并重试该步骤</span>
+        </el-form-item>
+        <el-form-item label="执行前预检">
+          <el-switch v-model="editForm.popup_precheck" :disabled="!editForm.auto_dismiss_popup" />
+          <span class="form-hint">启动 App 后先清一轮弹窗，不等某步失败才补救</span>
+        </el-form-item>
       </el-form>
       <template #footer>
         <span class="dialog-footer">
@@ -229,7 +239,10 @@ const editForm = reactive({
   status: 'IN_PROGRESS',
   base_url: '',
   start_date: null,
-  end_date: null
+  end_date: null,
+  // 项目级弹窗策略（后端 UiProject.auto_dismiss_popup / popup_precheck）
+  auto_dismiss_popup: true,
+  popup_precheck: true
 })
 
 // 表单验证规则
@@ -356,7 +369,10 @@ const editProject = (project) => {
     status: project.status,
     base_url: project.base_url,
     start_date: project.start_date ? new Date(project.start_date) : null,
-    end_date: project.end_date ? new Date(project.end_date) : null
+    end_date: project.end_date ? new Date(project.end_date) : null,
+    // 老数据可能没有该字段（undefined），一律回退成 true，与后端默认一致
+    auto_dismiss_popup: project.auto_dismiss_popup !== false,
+    popup_precheck: project.popup_precheck !== false
   })
   showEditDialog.value = true
 }
@@ -465,6 +481,14 @@ onMounted(() => {
   padding: 20px;
   height: 100%;
   overflow-y: auto;
+}
+
+/* 开关旁的说明文字：不让它和 switch 挤在一起，也不需要用户点开问号才知道含义 */
+.form-hint {
+  margin-left: 10px;
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .page-header {

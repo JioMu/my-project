@@ -22,6 +22,7 @@ import random
 import threading
 import time
 import subprocess
+from urllib.parse import urlsplit
 
 from .smart_locator import smart_match_locator, parse_swipe_pattern, get_wheel_coords, dump_page_elements
 
@@ -1758,9 +1759,10 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
                 # 异步执行 Appium 测试
                 def run_appium_test():
+                    aborted = False
                     try:
                         engine_config = {
-                            'appium_server_url': device.appium_server_url,
+                            'appium_server_url': get_appium_server_url(device),
                             'platform': device.platform,
                             'device_udid': device.udid,
                             'app_package': app_config.package_name,
@@ -1789,7 +1791,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                         execution_logs.append(f"========== Appium 引擎初始化 ==========")
                         execution_logs.append(f"✓ Appium 连接成功: {device.platform} 设备 {device.name}")
                         execution_logs.append(f"  应用: {app_config.name}")
-                        execution_logs.append(f"  Server: {device.appium_server_url}")
+                        execution_logs.append(f"  Server: {engine_config['appium_server_url']}")
                         execution_logs.append("")
 
                         if steps_data:
@@ -1798,6 +1800,13 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                             execution_logs.append("")
 
                             for i, step_info in enumerate(steps_data, 1):
+                                # 检查点①：步骤开始前。用户可能在上一步执行期间点了「停止执行」，
+                                # 这时不应再启动新步骤（否则要多等一整步才生效）。
+                                if _abort_requested(execution.id):
+                                    aborted = True
+                                    execution_logs.append(
+                                        f"[中止] 收到终止信号，步骤 {i}-{len(steps_data)} 未执行")
+                                    break
                                 execution_logs.append(f"--- 步骤 {i}/{len(steps_data)} ---")
                                 execution_logs.append(f"操作: {step_info['action_type']} - {step_info['description']}")
 
@@ -1856,10 +1865,24 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
                                 execution_logs.append("")
 
+                                # 检查点②：步骤结束后。
+                                # 本步已成功但用户已点停止 → 不再执行下一步。
+                                if _abort_requested(execution.id):
+                                    aborted = True
+                                    execution_logs.append(
+                                        f"[中止] 收到终止信号，停止执行剩余 {len(steps_data) - i} 个步骤")
+                                    break
+
                         app_engine.disconnect()
                         execution_logs.append("========== 测试执行完成 ==========")
 
                         # 更新执行记录
+                        if aborted:
+                            execution_result['status'] = 'failed'
+                            execution_result['error_message'] = '用户中止执行'
+                            execution_logs.append(
+                                f"[中止] 已执行 {len(step_results)}/{len(steps_data)} 个步骤，"
+                                '已完成步骤的结果保留')
                         execution.execution_logs = '\n'.join(execution_logs)
                         execution.screenshots = screenshots
                         execution.step_results = step_results
@@ -1951,13 +1974,14 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                     return Response({'success': False, 'logs': execution.error_message}, status=status.HTTP_400_BAD_REQUEST)
 
                 def run_airtest_test():
+                    aborted = False
                     try:
                         _adb_host = getattr(device, 'adb_host', None) or None
                         at_engine = AirtestRecordingEngine(
                             serial=device.udid,
                             platform=device.platform,
                             app_package=app_config.package_name,
-                            wda_url=device.appium_server_url,
+                            wda_url=get_appium_server_url(device),
                             adb_host=_adb_host,
                         )
                         at_engine.connect()
@@ -1981,6 +2005,12 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                             execution_logs.append("")
 
                             for i, step_info in enumerate(steps_data, 1):
+                                # 检查点①：步骤开始前（同 Appium 分支）
+                                if _abort_requested(execution.id):
+                                    aborted = True
+                                    execution_logs.append(
+                                        f"[中止] 收到终止信号，步骤 {i}-{len(steps_data)} 未执行")
+                                    break
                                 execution_logs.append(f"--- 步骤 {i}/{len(steps_data)} ---")
                                 execution_logs.append(f"操作: {step_info['action_type']} - {step_info['description']}")
 
@@ -2039,10 +2069,23 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
                                 execution_logs.append("")
 
+                                # 检查点②：步骤结束后（同 Appium 分支）
+                                if _abort_requested(execution.id):
+                                    aborted = True
+                                    execution_logs.append(
+                                        f"[中止] 收到终止信号，停止执行剩余 {len(steps_data) - i} 个步骤")
+                                    break
+
                         at_engine.disconnect()
                         execution_logs.append("========== 测试执行完成 ==========")
 
                         # 更新执行记录
+                        if aborted:
+                            execution_result['status'] = 'failed'
+                            execution_result['error_message'] = '用户中止执行'
+                            execution_logs.append(
+                                f"[中止] 已执行 {len(step_results)}/{len(steps_data)} 个步骤，"
+                                '已完成步骤的结果保留')
                         execution.execution_logs = '\n'.join(execution_logs)
                         execution.screenshots = screenshots
                         execution.step_results = step_results
@@ -2853,12 +2896,51 @@ class TestCaseExecutionViewSet(viewsets.ModelViewSet):
         ids = request.data.get('ids', [])
         if not ids:
             return Response({'error': '未提供要删除的记录ID'}, status=status.HTTP_400_BAD_REQUEST)
-        
+
         # 确保只能删除有权限的记录
         queryset = self.get_queryset()
         deleted_count, _ = queryset.filter(id__in=ids).delete()
-        
+
         return Response({'message': f'成功删除 {deleted_count} 条记录'})
+
+    @action(detail=True, methods=['post'], url_path='abort')
+    def abort(self, request, pk=None):
+        """请求中止一条正在执行的记录。
+
+        语义与 APK 智能回归的 abort 一致：**置信号，不粗暴杀线程**。
+        执行线程在「每个步骤前后」重读 `abort_requested`，命中即停剩余步骤，
+        已完成的步骤结果保留（这些是排查问题的证据，不能丢）。
+
+        ⚠️ 能力边界（必须让用户知道）：
+        这只能停在「步骤之间」。如果某个步骤自身卡在 webdriver 的连接/命令上
+        （例如 Appium 连不上，urllib3 正在重试），要等该步骤自己的超时结束
+        才会走到检查点。所以文案不能承诺"立刻停止"。
+        """
+        execution = self.get_object()
+
+        if execution.status in ('passed', 'failed', 'error'):
+            return Response({
+                'success': False,
+                'message': f'该执行已结束（{execution.get_status_display()}），无需中止',
+                'status': execution.status,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            TestCaseExecution.objects.filter(id=execution.id).update(abort_requested=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('[中止] 置信号失败 execution=%s: %s', execution.id, exc)
+            return Response({'success': False, 'message': f'中止失败：{exc}'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        done = len(execution.step_results or [])
+        logger.warning('[中止] 用户请求终止 execution=%s（已完成 %d 步）', execution.id, done)
+        return Response({
+            'success': True,
+            'message': f'已发送终止信号（已完成 {done} 步，结果保留）。'
+                       '执行线程将在当前步骤结束后停止。',
+            'status': execution.status,
+            'abort_requested': True,
+        })
 
 
 
@@ -4030,6 +4112,24 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+        # 同一用户不允许并行跑多条 Playground：
+        # ① 同一台设备上两条指令会互相抢输入，结果不可信；
+        # ② 终止只能按用户定位，并行时"停哪一条"无法回答。
+        _key = _playground_key(request)
+        if _key in PLAYGROUND_ACTIVE:
+            return Response({
+                'status': 'failed',
+                'error': '上一条 Playground 指令还在执行中，请先点「终止执行」或等待其结束',
+            }, status=status.HTTP_409_CONFLICT)
+
+        _slot = {
+            'device_id': device_id,
+            'action': action,
+            'prompt': prompt[:80],
+            'aborted': False,
+            'started_at': timezone.now(),
+        }
+        PLAYGROUND_ACTIVE[_key] = _slot
         try:
             if (device.platform or '').strip().lower() == 'ios':
                 # iOS 真机走远端 WDA（设备配置的 wda_host / wda_port）
@@ -4040,12 +4140,57 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 result = engine.playground_run(prompt=prompt, action=action, launch_app=launch_app)
         except Exception as e:
             logger.warning('[Midscene Playground] 执行失败: %s', e)
+            # 被人工终止时 Node 服务被杀，引擎侧会抛连接类异常。
+            # 这时不能报"执行失败"（用户会以为是指令有问题），要说清是被终止。
+            if _slot['aborted']:
+                return Response({
+                    'status': 'aborted',
+                    'error': '已被人工终止执行',
+                    'logs': ['[终止] 用户手动终止，已停止本次 Playground 执行'],
+                })
             return Response(
                 {'status': 'failed', 'error': str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+        finally:
+            PLAYGROUND_ACTIVE.pop(_key, None)
+
+        # 正常返回路径同样要标 aborted（Node 被杀后引擎可能返回空结果而非抛异常）
+        if _slot['aborted']:
+            result['status'] = 'aborted'
+            result['error'] = '已被人工终止执行'
 
         return Response(result)
+
+    @action(detail=False, methods=['post'], url_path='midscene-playground/abort')
+    def midscene_playground_abort(self, request):
+        """终止正在执行的 Playground 指令。
+
+        ⚠️ 能力边界（必须让用户知道）：
+        midscene 的 Node 服务没有"取消当前动作"的接口，Python 线程又无法从外部
+        打断一个卡在 HTTP 等待上的调用。所以这里只能**杀掉 Node 服务进程**来硬停。
+        代价是：该引擎实例的会话一起失效，下次执行会自动重新拉起新进程（首次会慢几秒）。
+        这不是优雅取消，是"拔电源"，但对"卡在 Replanned 40 times 干等 4 分钟"
+        这种场景是唯一有效的手段。
+        """
+        key = _playground_key(request)
+        active = PLAYGROUND_ACTIVE.get(key)
+        if not active:
+            return Response({
+                'success': False,
+                'message': '当前没有正在执行的 Playground 指令',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        active['aborted'] = True
+        killed = _playground_kill_node()
+        logger.warning('[Playground] 用户终止执行 device=%s killed_node=%d',
+                       active.get('device_id'), killed)
+        return Response({
+            'success': True,
+            'message': ('已终止执行' if killed
+                        else '已置终止标记（未找到运行中的 Node 服务，可能在下次检查点生效）'),
+            'killed_node': killed,
+        })
 
     @staticmethod
     def _ios_playground_run(device, app_config, prompt, action, launch_app):
@@ -5291,13 +5436,26 @@ class AICaseViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            if _d.status != 'online':
-                # 状态本身就不是在线，没必要再花时间探测
-                probe_ok, probe_detail = False, '记录状态为「%s」' % _d.get_status_display()
-            else:
-                probe_ok, probe_detail = probe_device_reachable(_d)
+            # ⚠️ 不能因为 DB 里写着 offline 就直接拒绝（2026-10-29 实测踩坑）：
+            # status 是个会被写脏的缓存字段 —— 设备重插/重启后没人去改它，
+            # 就会一直停在 offline。旧写法 `if status != 'online': 直接判失败`
+            # 导致**明明 adb devices 能看到设备，却永远执行不了**，
+            # 而且因为不再探测，状态也永远不会被纠正回来（死锁）。
+            # 正确做法：只要不是 busy，一律做真实探测；探测成功就回写 online。
+            probe_ok, probe_detail = probe_device_reachable(_d)
 
-            if not probe_ok:
+            if probe_ok:
+                # 探测通过 -> 顺手把过期状态纠正回来，避免列表一直显示离线
+                if _d.status != 'online':
+                    _old_status = _d.status
+                    try:
+                        _d.status = 'online'
+                        _d.save(update_fields=['status', 'updated_at'])
+                        logger.info('[执行预检] 设备 %s 状态由 %r 纠正为 online（%s）',
+                                    _d.name, _old_status, probe_detail)
+                    except Exception:  # noqa: BLE001
+                        pass
+            else:
                 # 探测失败 -> 把真实结论落库，避免列表继续骗人
                 try:
                     if _d.status != 'busy':
@@ -5381,6 +5539,12 @@ class AICaseViewSet(viewsets.ModelViewSet):
             execution_mode='midscene',
             status='running',
             executed_by=user,
+            # 批次信息必须落库，否则列表页看不出"这是同一批并行里的第几台"，
+            # 会被误认为重复执行（见 models.AIExecutionRecord.batch_id 说明）。
+            batch_id=batch_id or '',
+            batch_index=batch_index if batch_total else 0,
+            batch_total=batch_total or 0,
+            device_name=(getattr(run_device, 'name', '') or '')[:120],
             logs=(
                 _batch_line +
                 '[Midscene] 执行设备：%s（%s %s，UDID %s）%s\n'
@@ -5646,6 +5810,85 @@ class AIExecutionRecordViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         instance.delete()
+
+    @action(detail=True, methods=['post'], url_path='stop')
+    def stop(self, request, pk=None):
+        """停止一条正在执行的 AI 用例。支持两种力度：
+
+        **优雅停止（默认）** —— 置 `STOP_SIGNALS` 信号。
+        执行线程在 `should_stop()` 回调里读到就退出，但该回调**只在步骤之间**被检查，
+        所以当前这一步会跑完。midscene 单步 aiAct 可能跑几十秒到几分钟，
+        用户会觉得"点了停止没反应"。
+
+        **立即停止（force=true）** —— 额外杀掉 midscene 的 Node 服务进程。
+        这是唯一能让卡在单步 `ai_action()` 里的调用立刻返回的手段
+        （Python 线程无法从外部打断阻塞中的 HTTP 等待）。
+        代价：该引擎会话失效，下次执行要重新拉起 Node（首次慢几秒）。
+        做法与 Playground 的终止完全一致，`_playground_kill_node()` 已真机验证。
+
+        ⚠️ STOP_SIGNALS 是**进程内内存字典**：多 worker / 重启后会丢。
+        因此两种力度都会把 status 落成 failed，
+        保证即使信号丢失，列表也不会永远停在「执行中」。
+        """
+        record = self.get_object()
+
+        if record.status not in ('pending', 'running'):
+            return Response({
+                'success': False,
+                'message': '该执行已结束（%s），无需停止' % record.get_status_display(),
+                'status': record.status,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        force = str(request.data.get('force', '')).lower() in ('1', 'true', 'yes')
+
+        # ① 置内存信号：让执行线程在下一个检查点退出（两种力度都要）
+        STOP_SIGNALS[record.id] = True
+
+        # ② 立即停止：杀掉执行该指令的 Node 服务，让卡住的调用当场返回
+        killed = 0
+        if force:
+            killed = _playground_kill_node()
+
+        # ③ 兜底落库。即使线程没读到信号（进程重启等），
+        #    也不该让记录永远显示"执行中"——那既不能重跑也看不出发生了什么。
+        done = len(record.steps_completed or [])
+        try:
+            _mode = '立即停止' if force else '停止'
+            record.logs = (record.logs or '') + (
+                '\n[%s] 用户手动%s执行（已完成 %d 个步骤，结果保留）%s\n'
+                % (_mode, _mode, done,
+                   ('，已终止 %d 个 midscene 进程' % killed) if killed else ''))
+            record.status = 'failed'
+            record.error_message = '用户手动停止执行'
+            record.end_time = timezone.now()
+            if record.start_time:
+                record.duration = (record.end_time - record.start_time).total_seconds()
+            record.save(update_fields=[
+                'logs', 'status', 'error_message', 'end_time', 'duration'])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('[停止] 落库失败 execution=%s: %s', record.id, exc)
+
+        logger.warning('[停止] 用户%s AI 执行 execution=%s（已完成 %d 步，killed=%d）',
+                       '立即停止' if force else '停止', record.id, done, killed)
+
+        if force:
+            msg = '已立即停止（已完成 %d 个步骤，结果保留）' % done
+            if killed:
+                msg += '，已终止 %d 个执行进程' % killed
+            else:
+                msg += '（未发现运行中的进程，可能已经结束）'
+        else:
+            msg = ('已发送停止信号（已完成 %d 个步骤，结果保留）。'
+                   '执行线程会在当前步骤结束后停止；如需立刻停止请用「立即停止」。'
+                   % done)
+
+        return Response({
+            'success': True,
+            'message': msg,
+            'status': 'failed',
+            'force': force,
+            'killed_node': killed,
+        })
 
     @action(detail=False, methods=['post'])
     def batch_delete(self, request):
@@ -6167,6 +6410,10 @@ def _probe_error_reason(exc):
     return text[:120] if text else '探测失败'
 
 
+#: 对"共享测试平台"无意义的 adb_host 取值：它们只会解析到后端自己。
+_ADB_LOOPBACK_HOSTS = {'127.0.0.1', 'localhost', '0.0.0.0', '::1'}
+
+
 def probe_device_reachable(device, timeout=5):
     """真实探测一台设备当前是否可用，返回 (online: bool, detail: str)。
 
@@ -6206,28 +6453,49 @@ def probe_device_reachable(device, timeout=5):
 
     if platform == 'android':
         host = (device.adb_host or '').strip()
-        # 兼容历史数据里写成 host:port 的形式
+        adb_port = '5037'
+        # 兼容历史数据里写成 host:port 的形式；把端口拆出来供 socket 探测
+        # 与 adb -P 共用，避免两处一个用 5037、一个用别的值。
         if host and host.count(':') == 1 and host.rsplit(':', 1)[1].isdigit():
-            host = host.rsplit(':', 1)[0]
+            host, adb_port = host.rsplit(':', 1)
+        # 公共平台关键防线：回环地址只对"设备所插的那台电脑"自己有意义。
+        # 后端（或容器）拿到 127.0.0.1 只会探测自己 —— 要么连不上，
+        # 要么更糟：恰好本机也跑着 adb server，于是显示在线，
+        # 但换成任何**其他用户**执行时都必然失败。
+        # 所以这里直接判为不可用，并明确告诉用户该填什么。
+        if host in _ADB_LOOPBACK_HOSTS:
+            return False, ('adb_host 不能是回环地址（%s）—— 公共平台上它只会指向服务器自己，'
+                           '其他用户执行必然失败。请改填「手机所插电脑」的局域网 IP:5037，'
+                           '并在那台电脑上运行 adb_remote_server.bat 自动注册。' % host)
         if host:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2.5)
             try:
-                sock.connect((host, 5037))
+                sock.connect((host, int(adb_port)))
             except Exception as exc:  # noqa: BLE001
-                return False, 'adb 服务 %s 不可达（%s）' % (host, exc)
+                return False, 'adb 服务 %s:%s 不可达（%s）' % (host, adb_port, exc)
             finally:
                 sock.close()
-        env = os.environ.copy()
+        # ⚠️ 用 `-H <host> -P <port>` 而不是环境变量 ADB_SERVER_SOCKET。
+        #
+        # 2026-10-29 实测踩坑：原来写 `ADB_SERVER_SOCKET=tcp:<host>`（**漏了端口**），
+        # adb 会把 `<host>:` 后半段当端口解析，实际去连 `host:5555`：
+        #     * cannot start server on remote host
+        #     adb: failed to check server version: ... host.docker.internal:5555
+        # 结果是**设备明明在线（adb devices 能看到）却永远探测失败**，
+        # 用户看到「记录状态为离线」被拦住无法执行。
+        # 用 -H/-P 显式指定最稳，也与 airtest_engine 侧的连法保持一致。
+        cmd = ['adb']
         if host:
-            env['ADB_SERVER_SOCKET'] = 'tcp:%s' % host
-        else:
-            env.pop('ADB_SERVER_SOCKET', None)
+            cmd += ['-H', host, '-P', adb_port]
+        cmd.append('devices')
+        env = os.environ.copy()
+        env.pop('ADB_SERVER_SOCKET', None)  # 避免与 -H/-P 冲突
         try:
-            proc = _sp.run(['adb', 'devices'], capture_output=True, text=True,
+            proc = _sp.run(cmd, capture_output=True, text=True,
                            timeout=10, env=env)
         except _sp.TimeoutExpired:
-            return False, 'adb devices 超时（%s）' % (host or '本机')
+            return False, 'adb devices 超时（%s:%s）' % (host or '本机', adb_port)
         except Exception as exc:  # noqa: BLE001
             return False, 'adb 不可用：%s' % exc
         states = {}
@@ -6699,6 +6967,18 @@ def device_agent_register(request):
         wda_port = 8100
     adb_host = (request.data.get('adb_host') or '').strip() or None
 
+    # 公共平台约束：Android 设备上报的 adb_host 必须是"设备所插电脑"的
+    # 局域网地址。回环地址（127.0.0.1/localhost）在共享平台上是个陷阱 ——
+    # 它会指向后端自己，别的用户执行时必然失败且很难看出原因。
+    # 这里静默纠正（丢掉地址）而不是报错：设备本身仍然要能登记上，
+    # 只是标记成"地址待补"，管理员在设备编辑里补正确 IP 即可。
+    adb_host_rejected = ''
+    if platform == 'android' and adb_host:
+        bare = adb_host.rsplit(':', 1)[0] if adb_host.count(':') == 1 else adb_host
+        if bare.strip() in _ADB_LOOPBACK_HOSTS:
+            adb_host_rejected = adb_host
+            adb_host = None
+
     if not udid and not wda_host:
         return Response({'success': False, 'message': 'udid 与 wda_host 至少需要提供一个'},
                         status=status.HTTP_400_BAD_REQUEST)
@@ -6725,11 +7005,15 @@ def device_agent_register(request):
         action = '标记离线'
     else:
         action = '更新'
+    message = '%s设备「%s」' % (action, device.name)
+    if adb_host_rejected:
+        message += '（已忽略回环 adb_host「%s」，请补填该电脑的局域网 IP）' % adb_host_rejected
     return Response({
         'success': True,
         'created': created,
         'online': reported == 'online',
-        'message': '%s设备「%s」' % (action, device.name),
+        'message': message,
+        'adb_host_rejected': adb_host_rejected,
         'data': AppDeviceSerializer(device).data,
     })
 
@@ -6859,6 +7143,128 @@ def ensure_ui_project(request):
 
 
 
+def _probe_device_online(device, timeout=8):
+    """轻量探测设备是否真的能被操作，返回 (ok, reason)。
+
+    为什么必须有这一步（2026-10-28 真实故障）：
+    Airtest 的 `connect_device()` 在设备**不在线时依然返回设备对象**（不抛异常），
+    后续 `start_app` / `screenshot` 全部静默失败。于是「开始录制」在设备
+    拔掉的情况下仍返回 `success=True`，耗时 70+ 秒，弹窗里 elements 为空、
+    截图空白 —— 用户看到的是「点了没反应」，完全不知道是设备掉了。
+    宁可这里明确失败，也不要给一个空壳会话。
+    """
+    platform = (getattr(device, 'platform', '') or 'android').lower()
+    udid = getattr(device, 'udid', '') or ''
+
+    if platform == 'ios':
+        wda = (getattr(device, 'appium_server_url', '') or '').strip()
+        if not wda:
+            return False, 'iOS 设备未配置 WDA 地址'
+        return True, ''  # iOS 由 WDA 侧报错，这里不阻塞
+
+    # Android：用 adb devices 核对 udid 是否真的在列表里
+    adb_host = (getattr(device, 'adb_host', '') or '').strip() or 'host.docker.internal'
+    port = '5037'
+    if ':' in adb_host:
+        adb_host, _, _p = adb_host.rpartition(':')
+        if _p.isdigit():
+            port = _p
+
+    # 用 Airtest 自带的 linux adb（容器里 PATH 中通常没有 adb）
+    try:
+        import airtest.core.android.static as _at_static
+        adb_bin = os.path.join(
+            os.path.dirname(_at_static.__file__), 'adb', 'linux', 'adb')
+        if not os.path.exists(adb_bin):
+            adb_bin = 'adb'
+    except Exception:
+        adb_bin = 'adb'
+
+    try:
+        out = subprocess.run(
+            [adb_bin, '-H', adb_host, '-P', port, 'devices'],
+            capture_output=True, timeout=timeout,
+        ).stdout.decode('utf-8', 'ignore')
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('[设备探测] adb devices 执行失败: %s', exc)
+        return True, ''  # 探测本身失败不阻塞，交给后续真实连接报错
+
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == udid:
+            if parts[1] == 'device':
+                return True, ''
+            return False, f'设备 {udid} 当前状态为 “{parts[1]}”（未就绪）'
+
+    return False, (f'设备 {udid} 未出现在 adb 设备列表中（adb 服务 {adb_host}:{port}）。'
+                   '请检查：① USB 线是否插好、手机是否已授权 USB 调试；'
+                   '② 插手机那台电脑上的 adb 服务是否已用 adb -a 启动并允许本机访问。')
+
+
+#: Playground 进行中的任务登记表。
+#:
+#: 为什么需要：Playground 是**前台同步执行** —— 请求线程里直接调
+#: `MidsceneAppEngine.playground_run()` → `page.ai_action()`，而这个调用
+#: 内部是 midscene 的 Node 服务在做多轮视觉推理，**没有可设置的取消位**，
+#: 一跑就可能几分钟（实测 aiAct 撞 replanning 上限要 4 分钟）。
+#: Python 无法从外部停掉一个卡在 HTTP 等待上的线程，唯一可行的硬中断是
+#: 杀掉正在执行这条指令的 Node 服务进程（与 APK 回归 `_kill_stale_node_service`
+#: 同一手法）。所以这里登记"谁的请求正在哪个线程里跑"，供终止接口定位。
+#: key = 用户 id（同一用户同时只允许一条 Playground 执行）
+PLAYGROUND_ACTIVE = {}
+
+
+def _playground_key(request):
+    return getattr(request.user, 'id', None)
+
+
+def _playground_kill_node():
+    """杀掉 midscene Node 服务，让卡住的 Playground 立刻返回。"""
+    try:
+        import glob
+        import signal
+        killed = 0
+        for p in glob.glob('/proc/[0-9]*/cmdline'):
+            try:
+                with open(p, 'rb') as f:
+                    cmd = f.read().decode('utf-8', 'ignore')
+            except Exception:  # noqa: BLE001
+                continue
+            # 只杀 midscene 自己的 Node 服务，不碰其它进程
+            if 'midscene' in cmd and ('node_service' in cmd or 'service.js' in cmd):
+                pid = int(p.split('/')[2])
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        return killed
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _abort_requested(execution_id, execution=None):
+    """检查某条执行记录是否被要求中止。
+
+    为什么每次都重读数据库而不是读缓存：
+    终止信号来自**另一个请求线程**，同进程内共享 dict 虽然可行，但执行线程
+    可能重启过（进程重启 / 多 worker），只有 DB 是唯一可靠的事实源。
+    读失败时按「未中止」处理 —— 宁可多跑一步，也不能因为一次查询抖动
+    让用户的正常执行莫名其妙被打断。
+    """
+    if not execution_id:
+        return False
+    try:
+        return bool(
+            TestCaseExecution.objects.filter(id=execution_id)
+            .values_list('abort_requested', flat=True)
+            .first()
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('[中止] 读取中止信号失败 execution=%s: %s', execution_id, exc)
+        return False
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def learn_elements(request):
@@ -6875,9 +7281,17 @@ def learn_elements(request):
     if not device_id or not app_config_id:
         return Response({'success': False, 'message': '缺少 device_id 或 app_config_id'}, status=400)
 
+    _appium_url = ''
+
     try:
         device = _resolve_recording_device(device_id)
         app_config = get_object_or_404(AppConfig, id=app_config_id)
+        _appium_url = get_appium_server_url(device)
+
+        _online, _why = _probe_device_online(device)
+        if not _online:
+            logger.warning('[learn_elements] 设备不可用: %s', _why)
+            return Response({'success': False, 'message': f'设备不可用：{_why}'}, status=400)
 
         if engine_type == 'airtest':
             from .airtest_engine import AirtestRecordingEngine
@@ -6886,13 +7300,13 @@ def learn_elements(request):
                 serial=device.udid,
                 platform=device.platform,
                 app_package=app_config.package_name,
-                wda_url=device.appium_server_url,
+                wda_url=get_appium_server_url(device),
                 adb_host=_adb_host,
             )
         else:
             from .appium_engine import AppiumTestEngine
             engine = AppiumTestEngine(
-                appium_server_url=device.appium_server_url,
+                appium_server_url=_appium_url,
                 platform=device.platform,
                 device_udid=device.udid,
                 app_package=app_config.package_name,
@@ -6924,6 +7338,11 @@ def learn_elements(request):
         hint = ''
         if 'instrumentation' in err_msg or 'not running' in err_msg or 'crashed' in err_msg:
             hint = ' 设备连接可能已断开，建议重新开始录制。'
+        elif 'connection refused' in err_msg or 'max retries exceeded' in err_msg:
+            hint = (f' 连不上 Appium Server（{_appium_url}）。请确认：'
+                    '① 宿主机已启动 Appium（appium --address 0.0.0.0 --port 4723）；'
+                    '② 端口 4723 对后端容器可达；'
+                    '③ 该录制引擎为 Appium。若只用真机直连，请把录制引擎切换为 Airtest。')
         return Response({'success': False, 'message': f'获取页面控件失败: {e}{hint}'}, status=500)
 
 
@@ -6973,7 +7392,7 @@ def _resolve_recording_device(device_id):
         return _types.SimpleNamespace(
             udid=nd.device_id,
             platform='android',
-            appium_server_url='http://localhost:4723',
+            appium_server_url='',
             adb_host=getattr(nd, 'adb_host', '') or '',
             name=nd.name or nd.device_id,
             _source='new',
@@ -6986,11 +7405,57 @@ def _resolve_recording_device(device_id):
     return _types.SimpleNamespace(
         udid=od.udid,
         platform=od.platform or 'android',
-        appium_server_url=od.appium_server_url or 'http://localhost:4723',
+        appium_server_url=od.appium_server_url or '',
         adb_host=getattr(od, 'adb_host', '') or '',
         name=od.name,
         _source='old',
     )
+
+
+_LOOPBACK_HOSTS = {'localhost', '127.0.0.1', '0.0.0.0', '::1', ''}
+
+
+def get_appium_server_url(device):
+    """解析 Appium Server 地址，避免把容器内的回环地址当成本机。
+
+    优先级：
+      1. 设备记录里的 appium_server_url（旧表字段，非回环地址才算数）
+      2. 环境变量 APPIUM_SERVER_URL
+      3. 设备 adb_host（手机 USB 所在电脑，Appium 通常同一台）上的 4723
+      4. 兜底 host.docker.internal:4723
+
+    背景：后端跑在 Docker 里，`localhost:4723` 指的是**容器自己**，
+    宿主机上的 Appium 永远连不上（报 Errno 111 Connection refused）。
+    """
+    import os
+
+    configured = (getattr(device, 'appium_server_url', '') or '').strip().rstrip('/')
+    if configured:
+        host = (urlsplit(configured).hostname or '').lower()
+        if host not in _LOOPBACK_HOSTS:
+            return configured
+
+    env_url = (os.environ.get('APPIUM_SERVER_URL') or '').strip().rstrip('/')
+    if env_url:
+        return env_url
+
+    adb_host = (getattr(device, 'adb_host', '') or '').strip()
+    # ⚠️ adb_host 可能是「host:port」形式（如 host.docker.internal:5037，
+    #    这是 ADB 端口 5037，与 Appium 的 4723 完全无关）。直接拼会得到
+    #    `host.docker.internal:5037:4723` 这种非法 URL，报
+    #    "Failed to parse: .../session"。必须先剥掉端口只留主机名。
+    adb_port = 4723
+    if adb_host:
+        if ':' in adb_host:
+            _host, _, _port = adb_host.rpartition(':')
+            if _port.isdigit() and _host:
+                adb_host = _host
+        adb_host = adb_host.strip('/')
+    if adb_host and adb_host.lower() not in _LOOPBACK_HOSTS:
+        configured_port = urlsplit(configured).port if configured else None
+        return f'http://{adb_host}:{configured_port or adb_port}'
+
+    return 'http://host.docker.internal:4723'
 
 
 def _close_recording_session(key):
@@ -7010,12 +7475,23 @@ def _close_recording_session(key):
 
 
 def _get_screenshot_base64(engine):
-    """获取设备截图 base64（失败返回空串，不影响主流程）"""
+    """获取设备截图 base64（失败返回空串，不影响主流程）。
+
+    ⚠️ Appium 引擎截图挂在 `engine.driver` 上，Airtest 引擎**没有 driver 属性**，
+    截图方法直接挂在 engine 上（`AirtestRecordingEngine.get_screenshot_base64`）。
+    旧实现只认 `engine.driver` ⇒ Airtest 分支的截图恒为空串，
+    表现为「录制弹窗打开了但画面一片空白」，看起来像按钮没生效。
+    """
+    if not engine:
+        return ''
     try:
-        return engine.driver.get_screenshot_base64() if engine and engine.driver else ''
+        if getattr(engine, 'driver', None):
+            return engine.driver.get_screenshot_base64()
+        # Airtest 等其他引擎：方法挂在 engine 自身
+        if hasattr(engine, 'get_screenshot_base64'):
+            return engine.get_screenshot_base64()
+        return ''
     except Exception as e:
-        import logging
-        logger = logging.getLogger(__name__)
         logger.warning('获取设备截图失败: %s', e)
         return ''
 
@@ -7099,6 +7575,14 @@ def start_recording(request):
     except Exception as e:
         return Response({'success': False, 'message': f'参数无效: {e}'}, status=400)
 
+    # 先确认设备真的在线。否则 Airtest 的 connect_device 会"假装成功"，
+    # 最后返回一个 elements 为空、截图空白、还耗时 70 秒的空壳会话，
+    # 用户只会看到"点了没反应"。
+    _online, _why = _probe_device_online(device)
+    if not _online:
+        logger.warning('[start_recording] 设备不可用: %s', _why)
+        return Response({'success': False, 'message': f'设备不可用：{_why}'}, status=400)
+
     # 若已有会话，先关闭旧会话
     key = _recording_session_key(request)
     _close_recording_session(key)
@@ -7153,6 +7637,8 @@ def start_recording(request):
         except Exception:
             pass  # 清理失败不阻塞后续连接
 
+    _appium_url = get_appium_server_url(device)
+
     try:
         if engine_type == 'airtest':
             from .airtest_engine import AirtestRecordingEngine
@@ -7164,7 +7650,7 @@ def start_recording(request):
                 serial=device.udid,
                 platform=device.platform,
                 app_package=app_config.package_name,
-                wda_url=device.appium_server_url,
+                wda_url=_appium_url,
                 adb_host=_adb_host,
             )
             engine.connect()
@@ -7179,7 +7665,7 @@ def start_recording(request):
         else:
             from .appium_engine import AppiumTestEngine
             engine = AppiumTestEngine(
-                appium_server_url=device.appium_server_url,
+                appium_server_url=_appium_url,
                 platform=device.platform,
                 device_udid=device.udid,
                 app_package=app_config.package_name,
@@ -7206,6 +7692,11 @@ def start_recording(request):
                 ' 设备端 instrumentation 进程异常，建议：1) 重启 Appium Server；'
                 '2) 在设备上重新打开被测 App 后重试；3) 若仍失败，尝试 adb 重启设备。'
             )
+        elif 'connection refused' in err_msg or 'max retries exceeded' in err_msg:
+            hint = (f' 连不上 Appium Server（{_appium_url}）。请确认：'
+                    '① 宿主机已启动 Appium（appium --address 0.0.0.0 --port 4723）；'
+                    '② 端口 4723 对后端容器可达；'
+                    '③ 若只用真机直连，请把录制引擎切换为 Airtest。')
         return Response({'success': False, 'message': f'建立录制会话失败: {e}{hint}'}, status=500)
 
     RECORDING_SESSIONS[key] = {
@@ -7281,6 +7772,9 @@ def recording_page(request):
         hint = ''
         if 'instrumentation' in err_msg or 'not running' in err_msg or 'crashed' in err_msg:
             hint = ' 设备连接可能已断开，建议重新开始录制。'
+        elif 'connection refused' in err_msg or 'max retries exceeded' in err_msg:
+            hint = (' 连不上 Appium Server。请确认宿主机 Appium 已启动且容器可达 4723；'
+                    '若只用真机直连，请把录制引擎切换为 Airtest。')
         return Response({'success': False, 'message': f'获取页面控件失败: {e}{hint}'}, status=500)
 
 

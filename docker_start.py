@@ -76,6 +76,43 @@ if not cur.fetchone():
 else:
     print('step_results already exists')
 
+# 确保 ui_test_case_executions.abort_requested 列存在。
+# 执行线程在每个步骤前后重读该列，命中即停止剩余步骤（用例执行页的「停止执行」）。
+cur.execute(
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_schema = DATABASE() AND table_name = 'ui_test_case_executions' "
+    "AND column_name = 'abort_requested'",
+)
+if not cur.fetchone():
+    cur.execute(
+        'ALTER TABLE ui_test_case_executions '
+        'ADD COLUMN abort_requested TINYINT(1) NOT NULL DEFAULT 0'
+    )
+    print('ensured column abort_requested on ui_test_case_executions')
+else:
+    print('abort_requested already exists')
+
+# 确保 ui_projects 的项目级弹窗策略列存在（2026-10-29）。
+# 弹窗（权限/协议/广告）逐用例配置易漏，改为项目级配一次长期有效；
+# 用例级 AICase.auto_dismiss_popup 仍可覆盖。
+for _col, _ddl in (
+    ('auto_dismiss_popup',
+     'ADD COLUMN auto_dismiss_popup TINYINT(1) NOT NULL DEFAULT 1'),
+    ('popup_precheck',
+     'ADD COLUMN popup_precheck TINYINT(1) NOT NULL DEFAULT 1'),
+):
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'ui_projects' "
+        "AND column_name = %s",
+        (_col,),
+    )
+    if not cur.fetchone():
+        cur.execute('ALTER TABLE ui_projects ' + _ddl)
+        print('ensured column ui_projects.%s' % _col)
+    else:
+        print('ui_projects.%s already exists' % _col)
+
 # 确保需求拆解结果历史表存在（新功能：拆解结果历史记录）
 cur.execute('''
 CREATE TABLE IF NOT EXISTS requirement_analysis_results (
@@ -562,6 +599,12 @@ for _col, _ddl in (
     ('replay_degraded', 'ALTER TABLE ui_ai_execution_records ADD COLUMN replay_degraded TINYINT(1) NOT NULL DEFAULT 0'),
     ('replay_fail_reason', "ALTER TABLE ui_ai_execution_records ADD COLUMN replay_fail_reason VARCHAR(500) NOT NULL DEFAULT ''"),
     ('error_message', "ALTER TABLE ui_ai_execution_records ADD COLUMN error_message LONGTEXT NOT NULL DEFAULT ('')"),
+    # 多设备并行批次（2026-10-29）：旧实现只把「本批第 1/2 台」拼进日志文本，
+    # 列表页看不到，用户把并行产生的 N 条记录当成"重复执行/输出两条报告"。
+    ('batch_id', "ALTER TABLE ui_ai_execution_records ADD COLUMN batch_id VARCHAR(32) NOT NULL DEFAULT ''"),
+    ('batch_index', 'ALTER TABLE ui_ai_execution_records ADD COLUMN batch_index INT NOT NULL DEFAULT 0'),
+    ('batch_total', 'ALTER TABLE ui_ai_execution_records ADD COLUMN batch_total INT NOT NULL DEFAULT 0'),
+    ('device_name', "ALTER TABLE ui_ai_execution_records ADD COLUMN device_name VARCHAR(120) NOT NULL DEFAULT ''"),
 ):
     cur.execute(
         "SELECT 1 FROM information_schema.columns "
@@ -573,6 +616,20 @@ for _col, _ddl in (
         print('ensured column %s on ui_ai_execution_records' % _col)
     else:
         print('%s already exists on ui_ai_execution_records' % _col)
+
+# batch_id 索引：按批次聚合查询（"同一批的 N 条记录"）用得上。
+# 单独判断索引是否存在，避免重复 ADD INDEX 报 1061。
+cur.execute(
+    "SELECT 1 FROM information_schema.statistics "
+    "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_execution_records' "
+    "AND index_name = 'idx_ai_exec_batch'"
+)
+if not cur.fetchone():
+    cur.execute(
+        "ALTER TABLE ui_ai_execution_records ADD INDEX idx_ai_exec_batch (batch_id)")
+    print('ensured index idx_ai_exec_batch on ui_ai_execution_records')
+else:
+    print('idx_ai_exec_batch already exists on ui_ai_execution_records')
 
 # ui_ai_cases.steps 在老库是 text（上限 64KB，且无法做 JSON 查询），迁移后应为 json。
 # 只有现存数据全部是合法 JSON 时才转换，避免 ALTER 失败阻断启动。
@@ -644,6 +701,160 @@ CREATE TABLE IF NOT EXISTS app_pipeline_runs (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 ''')
 print('ensured table app_pipeline_runs')
+
+
+# 确保 APK 智能回归两张表存在（MVP：APK 上传 → REA 分析 → 人工确认 → Midscene → HTML 报告）。
+#
+# ⚠️ 外键列的整型宽度**必须与目标列逐字节一致**，否则 MySQL 3780
+# 「Referencing column and referenced column are incompatible」，而且
+# CREATE TABLE IF NOT EXISTS 会直接抛错把启动脚本带崩。
+# 实测两个库的真实类型并不统一（2026-10-28 核对）：
+#     dev  : ui_automation 用户表 = auth_user(INT)、app_configs INT、app_devices INT
+#     prod : users_user(BIGINT)、app_configs INT、app_devices INT
+# 所以这里**动态从 information_schema 读真实类型**，不要写死 INT/BIGINT。
+# 用户表名也不能写死：settings 的 db_table 实测 dev=auth_user、prod=users_user。
+_ut = None
+try:
+    from django.contrib.auth import get_user_model as _gum
+    _ut = _gum()._meta.db_table
+except Exception as _e:  # noqa: BLE001
+    print('resolve user table failed, fallback auth_user: %s' % _e)
+    _ut = 'auth_user'
+
+
+def _col_type(table, column, default='INT'):
+    try:
+        cur.execute(
+            "SELECT COLUMN_TYPE FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = %s AND column_name = %s",
+            (table, column))
+        _row = cur.fetchone()
+        return _row[0] if _row else default
+    except Exception:  # noqa: BLE001
+        return default
+
+
+_t_user = _col_type(_ut, 'id')
+_t_appcfg = _col_type('app_configs', 'id')
+_t_device = _col_type('app_devices', 'id')
+_t_project = _col_type('ui_projects', 'id')
+print('apk tables fk types: user(%s)=%s app_configs=%s app_devices=%s ui_projects=%s'
+      % (_ut, _t_user, _t_appcfg, _t_device, _t_project))
+
+try:
+    cur.execute(f'''
+CREATE TABLE IF NOT EXISTS ui_apk_artifacts (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(200) NOT NULL DEFAULT '',
+    file VARCHAR(100) NOT NULL,
+    original_name VARCHAR(255) NOT NULL DEFAULT '',
+    size BIGINT NOT NULL DEFAULT 0,
+    sha256 VARCHAR(64) NOT NULL DEFAULT '',
+    package_name VARCHAR(200) NOT NULL DEFAULT '',
+    version_name VARCHAR(50) NOT NULL DEFAULT '',
+    version_code INT NULL,
+    min_sdk INT NULL,
+    target_sdk INT NULL,
+    launch_activity VARCHAR(300) NOT NULL DEFAULT '',
+    manifest_info JSON NULL,
+    parse_error VARCHAR(500) NOT NULL DEFAULT '',
+    app_config_id {_t_appcfg} NULL,
+    created_by_id {_t_user} NULL,
+    created_at DATETIME NOT NULL,
+    KEY idx_apk_artifacts_sha256 (sha256),
+    KEY idx_apk_artifacts_package (package_name),
+    CONSTRAINT fk_apk_artifact_app_config FOREIGN KEY (app_config_id) REFERENCES app_configs (id),
+    CONSTRAINT fk_apk_artifact_created_by FOREIGN KEY (created_by_id) REFERENCES {_ut} (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+''')
+    print('ensured table ui_apk_artifacts')
+
+    cur.execute(f'''
+CREATE TABLE IF NOT EXISTS ui_apk_regression_runs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    status VARCHAR(20) NOT NULL DEFAULT 'uploaded',
+    rea_analysis JSON NULL,
+    paths JSON NULL,
+    confirmation JSON NULL,
+    results JSON NULL,
+    log LONGTEXT,
+    summary JSON NULL,
+    report_path VARCHAR(500) NOT NULL DEFAULT '',
+    model_calls INT NOT NULL DEFAULT 0,
+    prompt_tokens INT NOT NULL DEFAULT 0,
+    completion_tokens INT NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL,
+    started_at DATETIME NULL,
+    finished_at DATETIME NULL,
+    duration DOUBLE NOT NULL DEFAULT 0,
+    artifact_id BIGINT NOT NULL,
+    device_id {_t_device} NULL,
+    project_id {_t_project} NULL,
+    created_by_id {_t_user} NULL,
+    KEY idx_apk_runs_status (status),
+    CONSTRAINT fk_apk_run_artifact FOREIGN KEY (artifact_id) REFERENCES ui_apk_artifacts (id),
+    CONSTRAINT fk_apk_run_device FOREIGN KEY (device_id) REFERENCES app_devices (id),
+    CONSTRAINT fk_apk_run_created_by FOREIGN KEY (created_by_id) REFERENCES {_ut} (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+''')
+    print('ensured table ui_apk_regression_runs')
+except Exception as _e:  # noqa: BLE001
+    # 建表失败不能阻断整个容器启动（其余功能与这两张表无关），
+    # 但必须把原因打出来，否则只会看到"接口 500 说表不存在"。
+    print('!! 创建 APK 回归表失败（不影响其它功能）: %s' % _e)
+
+# AI 智能模式专属模型配置（独立表，与 requirement_analysis.ai_model_config 完全隔离）。
+# 独立建表的意义：AIModelConfig 的 role 是全局共享的，同一 role 只能有一个 is_active，
+# 复用会导致「在 AI 智能模式启用模型」把墨刀需求分析在用的 analyzer 一起禁用。
+# APK 回归的业务资料输入源：context_docs / context_notes。
+# 老库没有这两列，用 ALTER 补（IF NOT EXISTS 语法 MySQL 8 不支持 ADD COLUMN IF NOT EXISTS，
+# 所以先查 information_schema 再决定是否加）。
+try:
+    cur.execute(
+        "SELECT COLUMN_NAME FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'ui_apk_regression_runs'")
+    _cols = {r[0] for r in cur.fetchall()}
+    if 'context_docs' not in _cols:
+        cur.execute("ALTER TABLE ui_apk_regression_runs "
+                    "ADD COLUMN context_docs JSON NULL")
+        print('added column ui_apk_regression_runs.context_docs')
+    if 'context_notes' not in _cols:
+        cur.execute("ALTER TABLE ui_apk_regression_runs "
+                    "ADD COLUMN context_notes LONGTEXT NULL")
+        print('added column ui_apk_regression_runs.context_notes')
+    # 人工终止信号：执行线程每跑完一条路径回查一次，置位即停止剩余路径。
+    if 'abort_requested' not in _cols:
+        cur.execute("ALTER TABLE ui_apk_regression_runs "
+                    "ADD COLUMN abort_requested TINYINT(1) NOT NULL DEFAULT 0")
+        print('added column ui_apk_regression_runs.abort_requested')
+except Exception as _e:  # noqa: BLE001
+    print('!! 补充 APK 回归业务资料字段失败（不影响其它功能）: %s' % _e)
+
+try:
+    cur.execute(f'''
+CREATE TABLE IF NOT EXISTS ui_ai_mode_model_configs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    role VARCHAR(20) NOT NULL,
+    model_type VARCHAR(20) NOT NULL DEFAULT 'qwen',
+    model_name VARCHAR(100) NOT NULL,
+    api_key VARCHAR(300) NOT NULL DEFAULT '',
+    base_url VARCHAR(300) NOT NULL DEFAULT '',
+    model_family VARCHAR(50) NOT NULL DEFAULT '',
+    max_tokens INT NOT NULL DEFAULT 4096,
+    temperature DOUBLE NOT NULL DEFAULT 0.3,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    notes VARCHAR(300) NOT NULL DEFAULT '',
+    created_by_id {_t_user} NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    KEY idx_aimode_role_active (role, is_active),
+    CONSTRAINT fk_aimode_cfg_created_by FOREIGN KEY (created_by_id) REFERENCES {_ut} (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+''')
+    print('ensured table ui_ai_mode_model_configs')
+except Exception as _e:  # noqa: BLE001
+    print('!! 创建 AI 智能模式模型配置表失败（不影响其它功能）: %s' % _e)
 """
     print("Ensuring center_x/center_y columns exist on ui_test_case_steps...")
     subprocess.run([sys.executable, "-c", ensure_script], check=False)

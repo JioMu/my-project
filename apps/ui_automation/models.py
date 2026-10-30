@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth import get_user_model
 from django.utils import timezone
+import hashlib
 import json
 
 User = get_user_model()
@@ -22,6 +23,18 @@ class UiProject(models.Model):
     end_date = models.DateField(null=True, blank=True, verbose_name='结束日期')
     owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='owned_ui_projects', verbose_name='负责人')
     members = models.ManyToManyField(User, blank=True, related_name='ui_projects', verbose_name='团队成员')
+    # ---- 全局弹窗策略（项目级，2026-10-29）----
+    # 为什么放项目级而不是每条用例各配一遍：权限框/隐私协议/开屏广告几乎每个 App
+    # 冷启动都会弹，逐条用例声明既啰嗦又必然漏配；项目级配一次长期有效。
+    # 用例级（AICase.auto_dismiss_popup）仍然可以覆盖，优先级更高。
+    auto_dismiss_popup = models.BooleanField(
+        default=True, verbose_name='自动处理弹窗',
+        help_text='执行时遇到权限请求/协议/广告等弹窗自动关闭并重试该步骤'
+    )
+    popup_precheck = models.BooleanField(
+        default=True, verbose_name='执行前预检弹窗',
+        help_text='启动 App 后先清一轮弹窗再开始执行，不等某一步失败才补救'
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
 
@@ -724,6 +737,9 @@ class TestCaseExecution(models.Model):
     execution_time = models.FloatField(null=True, blank=True, verbose_name='执行时长(秒)')
     started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
     finished_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
+    #: 人工终止信号。执行线程在「每个步骤前后」重读该字段，命中即停剩余步骤。
+    #: 不缓存到内存里：用户点「停止执行」后应尽快生效，而执行线程可能换过。
+    abort_requested = models.BooleanField(default=False, verbose_name='是否请求中止')
     created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='test_case_executions', verbose_name='执行人')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
 
@@ -1248,6 +1264,29 @@ class AIExecutionRecord(models.Model):
         help_text='仅在 replay_degraded=True 时有值'
     )
 
+    # ---- 多设备并行批次 ----
+    # ⚠️ 为什么必须落库（2026-10-29 用户反馈"好像输出两条报告"）：
+    #   多选 N 台设备时会为每台各建一条执行记录，旧实现只把批次信息拼进
+    #   **日志文本**里（'本批第 1/2 台（批次 xxx）'），列表页拿不到
+    #   ⇒ 用户看到同一用例、几乎同一时刻的两条记录，第一反应是"重复执行了"。
+    #   落库后列表可以标「第 1/2 台」并给出批次说明。
+    batch_id = models.CharField(
+        max_length=32, blank=True, default='', db_index=True,
+        verbose_name='并行批次号',
+        help_text='多设备并行执行时同一批记录共用一个值；单设备执行时为空'
+    )
+    batch_index = models.IntegerField(
+        default=0, verbose_name='批次内序号', help_text='从 1 开始，0 表示未参与并行批次'
+    )
+    batch_total = models.IntegerField(
+        default=0, verbose_name='批次设备总数', help_text='本批共有几台设备并行执行'
+    )
+    device_name = models.CharField(
+        max_length=120, blank=True, default='', verbose_name='执行设备名称快照',
+        help_text='执行时所用设备的名称；设备改名/删除后仍能看出跑在哪台机器上'
+    )
+
+
     class Meta:
         db_table = 'ui_ai_execution_records'
         verbose_name = 'AI执行记录'
@@ -1381,4 +1420,378 @@ class BusinessAction(models.Model):
         if self.assert_config:
             step['assert'] = self.assert_config
         return step
+
+
+# ==================== APK 智能回归（MVP：APK → REA → 人工确认 → Midscene → HTML 报告） ====================
+#
+# 与已有 AppPipelineRun 的区别（别混用）：
+#   AppPipelineRun = 「抓快照 → 生成 pytest → 跑 pytest → Allure」的脚本型流水线
+#   ApkRegressionRun = 「上传 APK → 静态+REA 分析 → 人工确认测试路径 → Midscene 真机执行 → HTML 报告」
+# 后者的用例载体是**路径（path）**，执行产物是**自包含 HTML**，不需要 pytest/Allure。
+
+
+class ApkArtifact(models.Model):
+    """上传的 APK 与其静态解析结果。
+
+    `sha256` 做去重：同一个包重复上传不必再存一份文件，也方便识别
+    「同一个包重新上传后分析结果却不同」这类问题（二进制没变 → 结果必须可复现）。
+    """
+    name = models.CharField(max_length=200, verbose_name='展示名称', blank=True, default='')
+
+    file = models.FileField(upload_to='apk/%Y/%m/', verbose_name='APK 文件')
+    original_name = models.CharField(max_length=255, blank=True, default='', verbose_name='原始文件名')
+    size = models.BigIntegerField(default=0, verbose_name='文件大小(字节)')
+    sha256 = models.CharField(max_length=64, blank=True, default='', db_index=True,
+                              verbose_name='SHA-256')
+
+    package_name = models.CharField(max_length=200, blank=True, default='', db_index=True,
+                                    verbose_name='包名')
+    version_name = models.CharField(max_length=50, blank=True, default='', verbose_name='版本名')
+    version_code = models.IntegerField(null=True, blank=True, verbose_name='版本号')
+    min_sdk = models.IntegerField(null=True, blank=True, verbose_name='minSdk')
+    target_sdk = models.IntegerField(null=True, blank=True, verbose_name='targetSdk')
+    launch_activity = models.CharField(max_length=300, blank=True, default='',
+                                       verbose_name='启动 Activity')
+
+    #: 直接存 `apk_inspector.inspect_apk()` 的原始结果（activities/permissions/
+    #: dangerous_permissions/has_cleartext …），避免为每个字段单独建模。
+    manifest_info = models.JSONField(default=dict, blank=True, verbose_name='清单解析结果')
+
+    #: 非空表示解析失败，值为可读原因（前端直接展示，不用猜）
+    parse_error = models.CharField(max_length=500, blank=True, default='', verbose_name='解析失败原因')
+
+    app_config = models.ForeignKey(
+        AppConfig, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='apk_artifacts', verbose_name='关联应用配置',
+        help_text='上传后自动创建/复用的 AppConfig（包名+启动 Activity 已回填）')
+
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True,
+                                   verbose_name='上传人')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='上传时间')
+
+    class Meta:
+        db_table = 'ui_apk_artifacts'
+        verbose_name = 'APK 制品'
+        verbose_name_plural = 'APK 制品'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return '%s %s' % (self.package_name or self.original_name, self.version_name or '')
+
+    @property
+    def display_name(self):
+        return self.name or self.original_name or self.package_name or ('APK#%s' % self.pk)
+
+
+class ApkRegressionRun(models.Model):
+    """一次「APK → 分析 → 确认 → 执行 → 报告」的完整运行。
+
+    状态机（非法流转由 workflow 层拦截，不靠前端约束）：
+        uploaded
+          → analyzing      （阶段1：静态清单 + REA 分析）
+          → analyzed       （产出 path 清单，等待人工确认）
+          → confirmed      （人工确认闸门通过，指纹绑定）
+          → running        （逐条路径 Midscene 真机执行）
+          → done / failed  （报告已生成 / 执行或分析出错）
+    """
+    STATUS_CHOICES = [
+        ('uploaded', '已上传'),
+        ('analyzing', '分析中'),
+        ('analyzed', '待确认'),
+        ('analyzing_failed', '分析失败'),
+        ('confirmed', '已确认'),
+        ('running', '执行中'),
+        ('done', '已完成'),
+        ('failed', '执行失败'),
+        ('cancelled', '已取消'),
+    ]
+
+    STATUS_MAP = dict(STATUS_CHOICES)
+
+    artifact = models.ForeignKey(ApkArtifact, on_delete=models.CASCADE,
+                                 related_name='runs', verbose_name='APK')
+    device = models.ForeignKey(AppDevice, on_delete=models.SET_NULL, null=True, blank=True,
+                               related_name='apk_runs', verbose_name='执行设备')
+    project = models.ForeignKey(UiProject, on_delete=models.SET_NULL, null=True, blank=True,
+                                related_name='apk_runs', verbose_name='所属项目')
+
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='uploaded',
+                              verbose_name='状态')
+
+    #: REA 分析结果（requirements / pages / dangerous_actions / exception_pages /
+    #: sensitive_pages / analysis_notes），`paths` 单独一列便于前端编辑与指纹。
+    rea_analysis = models.JSONField(default=dict, blank=True, verbose_name='REA 分析结果')
+    paths = models.JSONField(default=list, blank=True, verbose_name='测试路径清单')
+
+    # ---- 业务资料输入源（操作说明 / 知识库 / 人工补充） ----
+    #: 上传的操作说明文档（已抽取的纯文本）。
+    #: 存文本而不是只存文件路径：① 分析/重新分析要反复读，避免每次重解析；
+    #: ② 文件可能被清理，文本留下来才能复现当时的分析依据。
+    #: 结构：[{'name','text','chars','truncated','uploaded_at'}]
+    context_docs = models.JSONField(default=list, blank=True,
+                                    verbose_name='操作说明文档（已抽文本）')
+    #: 人工补充的业务说明（自由文本）
+    context_notes = models.TextField(blank=True, default='',
+                                     verbose_name='人工补充说明')
+
+    #: 人工确认记录：{approved, approved_at, approved_by, fingerprint, notes}
+    confirmation = models.JSONField(default=dict, blank=True, verbose_name='人工确认')
+
+    #: 逐条路径的执行结果（含 Midscene step 明细、截图、断言）
+    results = models.JSONField(default=list, blank=True, verbose_name='执行结果')
+
+    log = models.TextField(blank=True, default='', verbose_name='运行日志')
+    summary = models.JSONField(default=dict, blank=True, verbose_name='结果摘要')
+    report_path = models.CharField(max_length=500, blank=True, default='', verbose_name='HTML 报告路径')
+    # 「人工终止」信号：执行线程每跑完一条路径就回查一次，置位则停止剩余路径。
+    # 为什么要独立字段而不是只看 status：中止时会把 status 直接落成 failed，
+    # 若用 status 判断，线程无法区分"被中止"和"自己跑挂"，也读不到用户意图。
+    abort_requested = models.BooleanField(
+        default=False, verbose_name='已请求中止',
+        help_text='用户点了「终止执行」后置位；执行线程在下一条路径开始前读取并停止')
+
+    model_calls = models.IntegerField(default=0, verbose_name='模型调用次数')
+    prompt_tokens = models.IntegerField(default=0, verbose_name='输入 token')
+    completion_tokens = models.IntegerField(default=0, verbose_name='输出 token')
+
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True,
+                                   verbose_name='创建人')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
+    duration = models.FloatField(default=0, verbose_name='耗时(秒)')
+
+    class Meta:
+        db_table = 'ui_apk_regression_runs'
+        verbose_name = 'APK 智能回归运行'
+        verbose_name_plural = 'APK 智能回归运行'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return 'APK回归 #%s - %s - %s' % (
+            self.pk, self.artifact.display_name if self.artifact_id else '',
+            self.get_status_display())
+
+    # ---- 人工确认闸门 ----
+    #: 参与确认指纹的字段 —— **故意不含 `name`**。
+    #:
+    #: 方案 C（2026-10-28 与用户确认）：改「路径名称」只是改标注，不影响实际跑什么，
+    #: 不应该让确认失效（否则改个错别字都要重新确认一遍）；
+    #: 改「步骤/跳过项/类型」是真的改了行为，必须重新人工确认。
+    #: 这个边界就是"执行内容"与"展示文案"的分界。
+    FINGERPRINT_FIELDS = ('steps', 'skip', 'type')
+
+    def execution_payload(self):
+        """只包含**会影响真机执行结果**的字段，用于计算确认指纹。"""
+        out = []
+        for p in (self.paths or []):
+            if not isinstance(p, dict):
+                out.append(p)
+                continue
+            item = {k: p.get(k) for k in self.FINGERPRINT_FIELDS}
+            # steps / skip 做归一化：去掉首尾空白、丢弃空项，
+            # 避免"多了个空格"也被判成内容变更而反复要求确认。
+            item['steps'] = [str(s).strip() for s in (p.get('steps') or [])
+                             if str(s or '').strip()]
+            item['skip'] = [str(s).strip() for s in (p.get('skip') or [])
+                            if str(s or '').strip()]
+            out.append(item)
+        return out
+
+    def paths_fingerprint(self):
+        """把「会真正执行的内容」算成一个 SHA-256 指纹。
+
+        沿用墨刀线 `ModaoPrototype.case_generation_fingerprint()` 的思路：
+        批准绑定的是**内容指纹**而不是时间戳，因此批准后再改内容会自动失效，
+        必须重新确认 —— 防止「确认过 A 路径，实际跑的是被偷偷改成 B 的路径」。
+
+        ⚠️ 指纹范围见 `FINGERPRINT_FIELDS`：**不含 name**。
+        所以改名称不会触发失效，改步骤会。
+        """
+        payload = json.dumps(self.execution_payload(), ensure_ascii=False,
+                             sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+    def is_approved(self):
+        """当前路径清单是否已被人工确认（指纹必须匹配）。"""
+        conf = self.confirmation or {}
+        if not conf.get('approved'):
+            return False
+        return conf.get('fingerprint') == self.paths_fingerprint()
+
+    def approval_blockers(self):
+        """未通过确认闸门的原因（可读列表，直接回给前端）。"""
+        reasons = []
+        if not (self.paths or []):
+            reasons.append('尚未生成任何测试路径，无法确认')
+        # 解析错误在 artifact 上，不在 run 上（曾误写成 self.parse_error 直接 AttributeError）
+        parse_error = getattr(getattr(self, 'artifact', None), 'parse_error', '') or ''
+        if parse_error:
+            reasons.append('APK 解析失败：%s' % parse_error)
+        if not (self.confirmation or {}).get('approved'):
+            reasons.append('尚未人工确认测试路径')
+        elif not self.is_approved():
+            reasons.append('路径清单在确认后被修改，原确认已失效，请重新确认')
+        return reasons
+
+
+# ======================================================================
+# AI 智能模式：独立的模型配置
+# ======================================================================
+class AiModeModelConfig(models.Model):
+    """「AI 智能模式」模块专属的模型配置（**与 requirement_analysis.AIModelConfig 完全隔离**）。
+
+    为什么新建一张表，而不是复用 AIModelConfig
+    ------------------------------------------
+    1. **互不干扰是硬要求**：AIModelConfig 的 role 是全局共享的，同一 role 只能有一个
+       is_active=True（保存时会批量禁用同角色其它记录）。若 AI 智能模式复用
+       `role='analyzer'`，用户在配置页"启用新模型"就会把墨刀需求分析正在用的
+       analyzer 一起禁掉 —— 这正是用户明确要避免的"两个地方统一"。
+    2. **作用域清晰**：本表只服务 AI 智能模式（APK 回归 / Midscene 等），
+       其它功能继续读 AIModelConfig，改这里不会波及别处。
+
+    两个角色（一次分析 + 一次执行，能力需求不同，必须分开配）
+      - analysis  ：纯文本推理，读 APK 静态清单产出测试路径。便宜、快即可。
+      - vision    ：多模态视觉，看截图定位元素。必须支持图片输入。
+    """
+
+    ROLE_ANALYSIS = 'analysis'
+    ROLE_VISION = 'vision'
+    ROLE_CHOICES = [
+        (ROLE_ANALYSIS, '分析与编排（文本推理）'),
+        (ROLE_VISION, '真机执行（视觉多模态）'),
+    ]
+
+    #: 与 AIModelConfig.MODEL_CHOICES 对齐，另外补上方案里实际在用的几个
+    MODEL_CHOICES = [
+        ('deepseek', 'DeepSeek'),
+        ('qwen', '通义千问 (Qwen)'),
+        ('openai', 'OpenAI'),
+        ('azure_openai', 'Azure OpenAI'),
+        ('anthropic', 'Anthropic'),
+        ('google_gemini', 'Google Gemini'),
+        ('siliconflow', '硅基流动 (SiliconFlow)'),
+        ('other', '其他 (OpenAI 兼容)'),
+    ]
+
+    name = models.CharField(max_length=100, verbose_name='配置名称')
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, verbose_name='用途角色',
+                            db_index=True)
+    model_type = models.CharField(max_length=20, choices=MODEL_CHOICES,
+                                  verbose_name='模型提供商', default='qwen')
+    model_name = models.CharField(max_length=100, verbose_name='模型名称',
+                                  help_text='如 deepseek-chat / qwen3.7-plus')
+    api_key = models.CharField(max_length=300, blank=True, default='',
+                               verbose_name='API Key')
+    base_url = models.CharField(max_length=300, blank=True, default='',
+                                verbose_name='API Base URL',
+                                help_text='OpenAI 兼容地址，如 https://dashscope.aliyuncs.com/compatible-mode/v1')
+    model_family = models.CharField(
+        max_length=50, blank=True, default='', verbose_name='Midscene 模型家族',
+        help_text='仅视觉角色用：midscene 的 MIDSCENE_MODEL_FAMILY，'
+                  '如 qwen3-vl / doubao-vision / gemini / glm-v。留空则按提供商自动推断')
+    max_tokens = models.IntegerField(default=4096, verbose_name='最大 Token 数')
+    temperature = models.FloatField(default=0.3, verbose_name='温度参数')
+    is_active = models.BooleanField(default=True, verbose_name='是否启用')
+    notes = models.CharField(max_length=300, blank=True, default='', verbose_name='备注')
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True,
+                                   related_name='ai_mode_model_configs', verbose_name='创建者')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'ui_ai_mode_model_configs'
+        verbose_name = 'AI 智能模式模型配置'
+        verbose_name_plural = 'AI 智能模式模型配置'
+        ordering = ['role', '-is_active', '-updated_at']
+        indexes = [models.Index(fields=['role', 'is_active'])]
+
+    def __str__(self):
+        return '%s - %s(%s)' % (self.get_role_display(), self.name, self.model_name)
+
+    #: 各提供商默认的 OpenAI 兼容 Base URL（用户没填时兜底）
+    DEFAULT_BASE_URLS = {
+        'deepseek': 'https://api.deepseek.com',
+        'qwen': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        'siliconflow': 'https://api.siliconflow.cn/v1',
+        'openai': 'https://api.openai.com/v1',
+    }
+
+    #: 视觉角色在 midscene 里需要的 model family（用户没填时按提供商/模型名推断）
+    #: 取值须在 midscene 支持的集合内：doubao-vision/gemini/qwen2.5-vl/qwen3-vl/glm-v/gpt-5 等。
+    #: 写错会被 midscene 直接判为非法值（回退成 openai 后报错），所以宁可留空让它自己认。
+    def resolved_base_url(self):
+        return (self.base_url or '').strip() or self.DEFAULT_BASE_URLS.get(self.model_type, '')
+
+    def resolved_family(self):
+        """推断 midscene 的 MIDSCENE_MODEL_FAMILY。
+
+        ⚠️ family 为空会让 midscene 回退到非法值 `openai` 并直接报错，
+        所以这里的推断宁可给出一个合理值，也不要返回空。
+
+        踩过的坑（2026-10-28）：最初只认模型名里带 "vl" 的（qwen3-vl / qwen2.5-vl），
+        但本项目实际在用的多模态模型叫 `qwen3.7-plus` —— 名字里根本没有 "vl"，
+        于是推断结果为空，真机执行时才暴露成 "Invalid MIDSCENE_MODEL_FAMILY"。
+        ⇒ 判断 qwen 系是否为多模态，改为按 `qwen3`/`vl`/`omni` 任一命中来认。
+        宁可对纯文本 qwen 也给 qwen3-vl（最多浪费一次调用），
+        也不要让视觉角色拿到空 family 直接崩。
+        """
+        fam = (self.model_family or '').strip()
+        if fam:
+            return fam
+
+        mn = (self.model_name or '').lower()
+        mt = (self.model_type or '').lower()
+
+        # 阿里 / 通义：qwen3.x-*、*-vl-*、*-omni-* 都是多模态
+        if 'qwen' in mn or mt == 'qwen':
+            if mn.startswith('qwen3'):
+                return 'qwen3-vl'
+            if 'vl' in mn or 'omni' in mn:
+                return 'qwen3-vl'
+            if mn.startswith('qwen2') or 'qwen2' in mn:
+                return 'qwen2.5-vl'
+            return 'qwen3-vl'
+
+        if 'glm' in mn or 'glm' in mt:
+            return 'glm-v'
+        if 'gemini' in mn or mt == 'google_gemini':
+            return 'gemini'
+        if 'doubao' in mn or 'seed' in mn:
+            return 'doubao-vision'
+        if mn.startswith('gpt-') or 'gpt' in mn:
+            return 'gpt-5'
+        return ''
+
+    def as_runtime_config(self):
+        """转成 midscene_engine / apk_rea 需要的 dict 形态。"""
+        return {
+            'api_key': (self.api_key or '').strip(),
+            'base_url': self.resolved_base_url(),
+            'model_name': self.model_name or '',
+            'model_family': self.resolved_family(),
+            'max_tokens': self.max_tokens,
+            'temperature': self.temperature,
+        }
+
+
+def get_active_ai_mode_config(role):
+    """按角色取 AI 智能模式的启用配置，返回 (config, error)。
+
+    同一角色有多个启用记录时按 updated_at 取最新 —— 保存逻辑会保证只有一个启用，
+    这里再兜一层，避免脏数据导致行为不确定。
+    """
+    if role not in (AiModeModelConfig.ROLE_ANALYSIS, AiModeModelConfig.ROLE_VISION):
+        return None, '未知角色：%s' % role
+    qs = AiModeModelConfig.objects.filter(role=role, is_active=True)
+    cfg = qs.order_by('-updated_at').first()
+    if not cfg:
+        label = dict(AiModeModelConfig.ROLE_CHOICES).get(role, role)
+        return None, ('AI 智能模式未配置「%s」模型，请到「AI 智能模式 → 模型配置」新增并启用' % label)
+    if not (cfg.api_key or '').strip():
+        return None, '「%s」模型「%s」缺少 API Key' % (cfg.get_role_display(), cfg.name)
+    if not cfg.model_name:
+        return None, '「%s」模型「%s」缺少模型名称' % (cfg.get_role_display(), cfg.name)
+    return cfg, ''
+
 

@@ -356,6 +356,21 @@ class AIExecutionReportGenerator:
                 except (TypeError, ValueError):
                     step_number = pos + 1
 
+            # ---- 公共步骤来源标记 ----
+            # 引擎展开 `{ref: '启动 测试'}` 时会写 `_ref`，多动作拆分还会写
+            # `_ref_index` / `_ref_total`。透到报告里，前端就能显示
+            # 「公共步骤：启动 测试（2/5）」，而不是只看到一个和公共步骤同名的
+            # 独立条目 —— 那正是用户以为"输出两条报告"的观感来源。
+            ref = step.get('_ref') or ''
+            ref_index = step.get('_ref_index')
+            ref_total = step.get('_ref_total')
+            group = ''
+            if ref:
+                if ref_index and ref_total:
+                    group = '%s（%s/%s）' % (ref, ref_index, ref_total)
+                else:
+                    group = ref
+
             detailed_steps.append({
                 'step_number': step_number,
                 'action': step.get('action', ''),
@@ -367,6 +382,11 @@ class AIExecutionReportGenerator:
                 'timestamp': step.get('timestamp', ''),
                 'thinking': step.get('thinking', ''),
                 'error': step.get('error', ''),
+                # 公共步骤来源（空串 = 用例自带步骤，前端不显示标签）
+                'ref_name': ref,
+                'ref_group': group,
+                'ref_index': ref_index or 0,
+                'ref_total': ref_total or 0,
                 # 每一步都要有自己的截图：失败用失败截图，成功用执行后的画面
                 'screenshot': _normalize_shot(
                     step.get('screenshot') or step.get('fail_screenshot') or ''

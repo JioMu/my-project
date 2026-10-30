@@ -176,6 +176,105 @@ curl -w "%{http_code}" http://localhost:8000/api/
 - 双路融合禁止对全部页面做固定长度的整体截断；按完整页面分批，单页极端超长时才分片。视觉未执行、视觉失败率超过 20%、融合结果为空或超过 20% 页面缺少 `source_pages` 证据时，阶段 0 必须阻断。
 - 使用真实私有原型做端到端视觉/LLM 回归会把截图和 DOM 派生内容发送给所配置的第三方模型服务，执行前需获得用户对该数据外发的明确批准；无批准时只做本地模拟和无模型导航验证。
 
+## APK 智能回归（`apps/ui_automation/apk_*`，MVP 已落地）
+
+链路：**APK 上传 → REA 分析 → 人工确认 → Midscene YAML/真机执行 → HTML 报告**。
+
+| 文件 | 职责 |
+|---|---|
+| `apk_inspector.py` | 纯 Python 解析 APK（zip + 二进制 AXML），取包名/版本/启动 Activity/权限；**不依赖 aapt2** |
+| `apk_context.py` | 业务资料来源：文档解析（docx/pdf/md/txt）、知识库汇总、拼装成提示词片段 |
+| `apk_rea.py` | REA 分析（analyzer→writer→规则兜底三级降级），产出 `paths` 并强制合并危险跳过项 |
+| `apk_yaml.py` | 路径 → Midscene YAML（单条/合集）；`check_dangerous()` 是 MVP 唯一危险操作拦截点 |
+| `apk_workflow.py` | 后台线程编排（分析 / 执行），含同一 run 的任务互斥、日志落库 |
+| `apk_report.py` | 自包含单文件 HTML 报告（CSS/截图 base64 内联，零外部资源） |
+| `apk_views.py` | 9 个 FBV 接口，挂在 `/api/ui-automation/apk-regression/` |
+
+### 分析输入源（决定路径质量的关键）
+
+`analyze_apk(artifact, run=run)` 的 `run` 参数决定能否读到业务资料。资料有三路，由
+`apk_context.build_business_context(run)` 拼装：**操作说明文档 → 项目知识库 → 人工补充说明**。
+
+| 有无资料 | 生成的路径 | 实测（万年历 APK） |
+|---|---|---|
+| 只有 APK 清单 | 泛化探索路径 | 「启动并进入主界面」「工具集合浏览」… |
+| 有操作说明 | 命中真实业务流程 + 每条标 `evidence` | 「新建日程完整流程 ← 填写标题、时间、重复规则后保存」 |
+
+- 文档**解析成纯文本后存 `context_docs` JSON 字段**，不依赖原文件长期存在（重新分析要反复读、文件可能被清理）。
+- 字符预算：单文档 20000、知识库 8000、补充说明 4000，超出截断并在 `truncated` 标记。
+- 知识库来自 `apps.projects.ProjectKnowledge`（纯文本按分类排序，**不需要 embedding**），
+  `run.project_id` 为空时不读知识库。
+- 提示词里**明确区分**"有资料/无资料"：无资料时才允许退回通用路径，且禁止编造页面名。
+- 新建 run 时前端**不再 auto_analyze** —— 要给用户机会先备料，否则永远只有通用路径。
+
+关键约束（改代码前务必读）：
+
+- **人工确认是服务端闸门**：`ApkRegressionRun.paths_fingerprint()` 对 `paths` 做 SHA-256，
+  确认后改路径 → `is_approved()` 立刻 False，`approval_blockers()` 给出可读原因。语义与墨刀线
+  `case_generation_fingerprint` 一致。**不要在前端做这个判断**。
+- **平台内执行走 `midscene_engine.MidsceneAppEngine`，不走 `npx midscene`**。YAML 是「可带走的资产」，
+  生成但平台执行不消费它 —— 在容器里再起一套 Node 工具链不值得。
+- **DB 结构三处都要改**：`models.py` + `migrations/0016_apk_regression.py` + `docker_start.py` 幂等 DDL。
+  由于 `0001_initial` 是空占位、启动时 `migrate --fake`，**真正建表只靠 `docker_start.py`**。
+- ⚠️ **外键列整型宽度必须与目标列一致**，否则 MySQL 3780。且 dev/prod 实测不同：
+  dev 用户表 = `auth_user`(INT)，prod = `users_user`(BIGINT)；`app_configs`/`app_devices` 两库都是 INT。
+  ⇒ DDL 必须**从 information_schema 动态读类型 + 动态取用户表名**，不要写死。
+- 分析/执行都在 `threading.Thread(daemon=True)`（无 Celery worker），线程内必须 `close_old_connections()`。
+
+验证手段（无需真机/真包）：`apk_inspector` 可自造最小 AXML 单测；`apk_rea`/`apk_yaml` 纯函数可离线断言；
+上传→确认→YAML→报告整链可用 `django.test.Client` + 自造 APK 跑通（`ALLOWED_HOSTS` 需临时加 `testserver`）。
+
+## 设备接入（共享测试平台约定）
+
+TestHub 是**公共测试平台**：设备插在任意一台局域网电脑上，其他用户都必须能用。
+
+| 平台 | 自动注册方式 | 脚本 |
+|---|---|---|
+| iOS | `ios_wda_host.bat` 起完 WDA 后调 `POST /device-agent/register/` | `scripts/ios_register_device.ps1` |
+| Android | `adb_remote_server.bat` 起完 `adb -a` 后调同一接口 | `scripts/adb_register_device.ps1`（新增） |
+
+三条硬约束（改任意一侧前必读）：
+
+1. **`adb_host` 绝不接受回环地址**（`127.0.0.1`/`localhost`/`0.0.0.0`）。共享平台上它指向的是后端自己，
+   会让设备显示在线而其他用户执行必然失败。脚本侧拒绝上报，`device_agent_register` 侧剥离该字段，
+   `probe_device_reachable` 与 `apk_workflow.start_execution` 侧报错阻断 —— 四处都拦，缺一处就会漏。
+2. **`adb_host` 不能用 `ipconfig | 第一个 IPv4`**：装了 Docker/WSL/VMware 的机器首条往往是 `172.x` 虚拟网卡。
+   统一走 `scripts/adb_detect_lan_ip.ps1`（排除虚拟网卡 → 优先 DHCP → 回落默认路由）。
+3. **设备以 UDID 唯一**：换电脑重注册只刷新同一行的地址与状态，不产生重复记录；`offline` 上报不带地址。
+
+宿主机前提：容器看不到宿主机 USB，adb server 必须 `adb -a -P 5037` 才能被后端访问
+（`netstat` 里应看到 `0.0.0.0:5037`，而不是 `127.0.0.1:5037`）。
+
+## AI 智能模式的模型配置（两套配置，故意隔离）
+
+平台里有**两套互不相干**的模型配置，改任何一套都不要去"统一"它们：
+
+| 入口 | 数据表 | 服务对象 | 谁在读 |
+|---|---|---|---|
+| 配置中心 → AI 模式（`/configuration/ai-mode`） | `ai_model_config`（`AIModelConfig`） | 全平台其它功能 | 需求分析、用例生成等 |
+| AI 智能模式 → 模型配置（`/ai-intelligent-mode/model-config`） | `ui_ai_mode_model_configs`（`AiModeModelConfig`） | **仅** AI 智能模式 | `apk_rea`、`MidsceneAppEngine(model_source='ai_mode')` |
+
+为什么必须分表（不是洁癖，是正确性）：
+
+- `AIModelConfig.role` 是**全局共享**的，同一 role 只能有一个 `is_active=True`（保存时批量禁用同角色其它记录）。
+  如果 AI 智能模式复用 `role='analyzer'`，用户在配置页"启用新模型"就会把墨刀需求分析正在用的
+  analyzer 一起禁掉。分表后 `AiModeModelConfig` 的互斥只在**本表同角色**内生效。
+- 两个角色（`analysis` 文本推理 / `vision` 视觉多模态）能力需求不同，必须分开配；
+  用单模型全包会导致文本模型看不了图（真机执行必挂）或视觉模型做文本分析（贵且慢）。
+
+`MidsceneAppEngine` 的模型来源是**显式参数** `model_source`：
+默认 `'legacy'`（读 `AIModelConfig`，原有 AICase / Playground 行为不变），
+只有 `apk_workflow` 传 `'ai_mode'`。**不要改默认值** —— 引擎有多个使用方，改默认会连带改动其它功能。
+
+改这套代码时注意三个已踩过的坑：
+1. `AIModelService.call_openai_compatible_api` 读 `config.api_key/base_url/model_name/max_tokens/temperature/top_p`，
+   **缺 `top_p` 不是回退默认值而是 AttributeError**（会让整条链路静默降级成规则兜底）。
+   `apk_rea._RuntimeModel` 是适配层，缺字段要补。
+2. `resolved_family()` 不能只认模型名里的 `vl`：本项目实际用的是 `qwen3.7-plus`（名字里没有 vl）。
+   family 为空会让 midscene 回退到非法值 `openai` 并报 `Invalid MIDSCENE_MODEL_FAMILY`。
+3. 视觉角色试连必须发**≥11x11 的图**：实测 qwen 拒收 1x1 并返回 400
+   （`height:1 or width:1 must be larger than 10`），会把"可用"误报成"连接失败"。
+
 ## Skill 注册表
 
 > 单一事实源：本仓库的“skill / 提示词能力”分散在 4 处、2 种格式。下表为统一注册表；新增、修改或迁移 skill 时必须同步更新本表，避免注册表与磁盘不一致。

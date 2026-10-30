@@ -4,11 +4,23 @@ setlocal EnableDelayedExpansion
 
 REM ============================================================
 REM TestHub Remote ADB Server launcher (generic for B/C/D PCs)
-REM Purpose: let midscene on server A control USB phone via this PC IP:5037
+REM Purpose: let TestHub (midscene) control a USB phone attached to THIS PC.
 REM Usage:
-REM   adb_remote_server.bat         start server (default, background)
-REM   adb_remote_server.bat install   register autostart task
-REM   adb_remote_server.bat uninstall remove autostart task
+REM   adb_remote_server.bat            start server + AUTO-REGISTER devices
+REM   adb_remote_server.bat install    register autostart task (register too)
+REM   adb_remote_server.bat uninstall  remove autostart task
+REM   adb_remote_server.bat stop       stop server + mark devices offline
+REM   adb_remote_server.bat no-register  start server only (skip registration)
+REM
+REM Why auto-register: iOS already auto-appeared in TestHub because
+REM ios_wda_host.bat calls ios_register_device.ps1. Android used to require a
+REM MANUAL "Scan devices" click, which people simply forgot. This script now
+REM registers every authorized device it finds, so plugging a phone into ANY
+REM LAN PC makes it available to EVERY TestHub user.
+REM
+REM Server URL / token (also settable as env vars):
+REM   TESTHUB_URL    e.g. http://192.168.8.75:8000
+REM   TESTHUB_TOKEN  must match DEVICE_AGENT_TOKEN in the backend .env
 REM Requirement: adb installed; USB debugging enabled and allowed on phone
 REM ============================================================
 
@@ -16,6 +28,9 @@ set ADB_PORT=5037
 set TASK_NAME=TestHub_ADB_Remote_Server
 set ADB_DIR=
 set ADB_EXE=
+set DO_REGISTER=1
+if /i "%~1"=="no-register" set DO_REGISTER=0
+if /i "%~1"=="stop" goto :do_stop
 
 REM ---- find adb binary: PATH first, then common SDK paths ----
 where adb >nul 2>nul
@@ -117,24 +132,84 @@ popd
 
 timeout /t 2 >nul
 
-REM ---- 5. self-test: can this PC reach phone via its own IP ----
+REM ---- 5. resolve the LAN IP the TestHub server must use to reach us ----
+REM Was: "ipconfig | findstr IPv4 | first match". On a PC with Docker / WSL /
+REM VMware / Hyper-V that first match is frequently a 172.x virtual adapter,
+REM and the platform then stores an adb_host that is unroutable from the
+REM backend container -> device shows online, every execution fails.
+REM Now delegated to adb_register_device.ps1 which scores real NICs first.
 set LOCAL_IP=
-for /f "tokens=2 delims=:" %%i in ('ipconfig ^| findstr "IPv4"') do (
-    set LOCAL_IP=%%i
-    goto :gotip
+for /f "delims=" %%i in ('powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0adb_detect_lan_ip.ps1"') do set LOCAL_IP=%%i
+if not defined LOCAL_IP (
+    echo [WARN] could not detect a LAN IP - registration will be skipped.
+    echo        Fix: connect this PC to the same LAN as TestHub and rerun.
 )
-:gotip
-set LOCAL_IP=%LOCAL_IP: =%
 
 echo ----------------------------------------
-echo self-test: "!ADB_EXE!" -H %LOCAL_IP% -P %ADB_PORT% devices
-"!ADB_EXE!" -H %LOCAL_IP% -P %ADB_PORT% devices
+if defined LOCAL_IP (
+    echo self-test: "!ADB_EXE!" -H !LOCAL_IP! -P %ADB_PORT% devices
+    "!ADB_EXE!" -H !LOCAL_IP! -P %ADB_PORT! devices
+    echo ----------------------------------------
+    echo adb_host registered on TestHub will be: !LOCAL_IP!:%ADB_PORT%
+)
+
+REM ---- 6. auto-register every authorized device on TestHub ----
+if "!DO_REGISTER!"=="1" (
+    call :register_all
+) else (
+    echo [skip] registration disabled ^(no-register^)
+)
+
 echo ----------------------------------------
-echo done. adb_host on server A should be: %LOCAL_IP%:%ADB_PORT%
-echo you can close this window; background server keeps running.
-echo stop with: adb kill-server
-echo for autostart, run as admin: %~nx0 install
+echo done. you can close this window; background server keeps running.
+echo stop with : %~nx0 stop   ^(or: adb kill-server^)
+echo autostart : %~nx0 install   ^(run as administrator^)
 echo ----------------------------------------
+pause
+endlocal
+goto :eof
+
+REM ============================================================
+REM  register every authorized device (the missing Android half)
+REM ============================================================
+:register_all
+if not defined TESTHUB_URL (
+    echo.
+    echo [skip] TESTHUB_URL is not set - devices will NOT auto-register.
+    echo        set TESTHUB_URL=http://^<platform-ip^>:8000  then rerun,
+    echo        or add the device manually in TestHub - Device Management.
+    goto :eof
+)
+echo.
+echo [6/6] registering devices on TestHub ^(!TESTHUB_URL!^) ...
+for /f "tokens=1,2" %%a in ('"!ADB_EXE!" devices ^| findstr /r /c:"^[^ ]*[ ]*device$"') do (
+    if /i not "%%a"=="List" (
+        echo   - registering %%a ...
+        powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0adb_register_device.ps1" ^
+            -ServerUrl "!TESTHUB_URL!" -Udid "%%a" -AdbHost "!LOCAL_IP!" -AdbPort %ADB_PORT% ^
+            -Token "!TESTHUB_TOKEN!"
+    )
+)
+goto :eof
+
+REM ============================================================
+REM  stop: mark our devices offline, then kill the server
+REM ============================================================
+:do_stop
+if defined TESTHUB_URL (
+    echo [stop] marking this PC's devices offline ...
+    for /f "tokens=1,2" %%a in ('"adb" devices 2^>nul ^| findstr /r /c:"^[^ ]*[ ]*device$"') do (
+        if /i not "%%a"=="List" (
+            powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0adb_register_device.ps1" ^
+                -ServerUrl "!TESTHUB_URL!" -Udid "%%a" -Status offline -Token "!TESTHUB_TOKEN!"
+        )
+    )
+) else (
+    echo [stop] TESTHUB_URL not set - devices left as-is ^(will show offline on next status refresh^)
+)
+echo [stop] killing adb server ...
+adb kill-server >nul 2>&1
+echo done.
 pause
 endlocal
 goto :eof

@@ -99,13 +99,23 @@
                第一行 = 执行 + 保存（动作类）；第二行 = 拆步（AI 辅助类，单独突出）。
                面板宽度在窄屏会被压到 360px，所以用 flex-wrap 让它自适应换行。 -->
           <div class="pg-actions">
+            <!-- 执行中：按钮变成「终止执行」。Playground 是同步请求，
+                 不提供终止就只能干等（aiAct 撞 replanning 上限要几分钟）。 -->
             <el-button
+              v-if="running"
+              type="danger"
+              :loading="aborting"
+              @click="abortPlayground"
+            >
+              {{ aborting ? '正在终止...' : '■ 终止执行' }}
+            </el-button>
+            <el-button
+              v-else
               type="primary"
-              :loading="running"
               :disabled="!form.app_config_id || !form.device_id || !form.prompt.trim()"
               @click="runPlayground"
             >
-              {{ running ? '执行中...' : '▶ 执行' }}
+              ▶ 执行
             </el-button>
             <el-button
               type="success"
@@ -393,7 +403,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Monitor, MagicStick, Refresh } from '@element-plus/icons-vue'
 import {
   getAppConfigs,
@@ -420,6 +430,7 @@ const form = reactive({
 })
 
 const running = ref(false)
+const aborting = ref(false)
 const screenshot = ref('')
 const logs = ref([])
 const resultError = ref('')
@@ -644,7 +655,10 @@ const runPlayground = async () => {
     if (data.query_result !== undefined) {
       logs.value.push('[aiQuery 返回] ' + JSON.stringify(data.query_result))
     }
-    if (data.status === 'failed') {
+    if (data.status === 'aborted') {
+      // 人工终止不是缺陷，用 warning，避免被误判成指令有问题
+      ElMessage.warning('执行已终止')
+    } else if (data.status === 'failed') {
       resultError.value = data.error || '未知错误'
     } else {
       ElMessage.success('执行成功')
@@ -655,6 +669,32 @@ const runPlayground = async () => {
     ElMessage.error('执行失败: ' + (e.response?.data?.error || e.message))
   } finally {
     running.value = false
+    aborting.value = false
+  }
+}
+
+// 终止执行：只发终止请求，不主动结束 running ——
+// 让原来那个执行请求自己返回（它会带回 aborted 状态和日志），
+// 这样用户能看到"被终止"而不是一个悬空的界面。
+const abortPlayground = async () => {
+  try {
+    await ElMessageBox.confirm(
+      '确认终止当前执行？会强制停止真机操作（未完成的指令不会执行完）。',
+      '终止执行',
+      { type: 'warning', confirmButtonText: '确认终止', cancelButtonText: '取消' }
+    )
+  } catch (e) {
+    return  // 用户取消
+  }
+  aborting.value = true
+  try {
+    const res = await api.post('/ui-automation/ai-cases/midscene-playground/abort/')
+    ElMessage.success(res.data?.message || '已终止执行')
+    logs.value.push('[终止] ' + (res.data?.message || '已发送终止信号'))
+  } catch (e) {
+    ElMessage.error('终止失败: ' + (e.response?.data?.message || e.message))
+  } finally {
+    aborting.value = false
   }
 }
 

@@ -155,14 +155,26 @@
                   <el-icon><View /></el-icon>
                   探测页面
                 </el-button>
-                <el-button size="small" type="danger" @click="openRecording">
-                  <el-icon><VideoCamera /></el-icon>
-                  开始录制
+                <el-button size="small" type="danger" :loading="isRecordingBusy" @click="openRecording">
+                  <el-icon v-if="!isRecordingBusy"><VideoCamera /></el-icon>
+                  {{ isRecordingBusy ? '连接设备中...' : '开始录制' }}
                 </el-button>
               </template>
-              <el-button size="small" type="success" @click="runTestCase(selectedTestCase)" :loading="isRunning">
-                <el-icon v-if="!isRunning"><CaretRight /></el-icon>
-                {{ isRunning ? '执行中...' : '运行' }}
+              <!-- 执行中：按钮直接变成「停止执行」，避免用户只能干等 -->
+              <el-button
+                v-if="isRunning"
+                size="small"
+                type="danger"
+                :loading="aborting"
+                :disabled="!runningExecutionId"
+                @click="stopExecution"
+              >
+                <el-icon v-if="!aborting"><CircleClose /></el-icon>
+                {{ aborting ? '正在停止...' : '停止执行' }}
+              </el-button>
+              <el-button v-else size="small" type="success" @click="runTestCase(selectedTestCase)">
+                <el-icon><CaretRight /></el-icon>
+                运行
               </el-button>
               <el-button size="small" v-if="executionResult" @click="toggleView">
                 <el-icon><component :is="showSteps ? 'View' : 'Edit'" /></el-icon>
@@ -926,7 +938,7 @@ import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  Search, Plus, Edit, Delete, Check, CaretRight, ArrowUp, ArrowDown, Rank, Picture, Warning, View, ZoomIn, Refresh, WarningFilled, MagicStick, VideoCamera, Upload, Clock, Loading
+  Search, Plus, Edit, Delete, Check, CaretRight, ArrowUp, ArrowDown, Rank, Picture, Warning, View, ZoomIn, Refresh, WarningFilled, MagicStick, VideoCamera, Upload, Clock, Loading, CircleClose
 } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import { useUnifiedProjects } from '@/utils/useUnifiedProjects'
@@ -942,6 +954,7 @@ import {
   runTestCase as runTestCaseApi,
   getTestCaseExecution,
   getTestCaseExecutions,
+  abortTestCaseExecution,
   copyTestCase as copyTestCaseApi,
   getLocatorStrategies,
   getAppDevices,
@@ -978,6 +991,9 @@ const showSteps = ref(true)
 const showScreenshotPreview = ref(false)
 const currentScreenshot = ref(null)
 const isRunning = ref(false)
+// 停止执行：记录当前正在跑的 execution_id 与「已发过终止信号」状态
+const runningExecutionId = ref(null)
+const aborting = ref(false)
 // 执行记录历史
 const executionHistory = ref([])
 const historyLoading = ref(false)
@@ -1361,6 +1377,7 @@ const runTestCase = async (testCase) => {
     // 必须轮询执行详情，拿真实状态(status)和每步结果(step_results)。
     const executionId = response.data.execution_id
     if (executionId) {
+      runningExecutionId.value = executionId
       await pollExecutionResult(executionId)
     } else {
       // 无 execution_id（极少数异常），退回原即时响应
@@ -1405,6 +1422,36 @@ const runTestCase = async (testCase) => {
     ElMessage.error(`执行测试用例失败: ${errorMessage}`)
   } finally {
     isRunning.value = false
+    runningExecutionId.value = null
+    aborting.value = false
+  }
+}
+
+// 停止执行：只置服务端信号，不粗暴中断轮询 —— 轮询要继续，
+// 这样才能把「已完成的步骤结果」实时展示出来（用户点停止后最想看的就是这个）。
+const stopExecution = async () => {
+  if (!runningExecutionId.value) {
+    ElMessage.warning('当前没有可停止的执行')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      '确认终止当前执行？执行线程会在当前步骤结束后停止，已完成的步骤结果会保留。',
+      '终止执行',
+      { type: 'warning', confirmButtonText: '确认终止', cancelButtonText: '取消' }
+    )
+  } catch (e) {
+    return  // 用户取消
+  }
+  aborting.value = true
+  try {
+    const res = await abortTestCaseExecution(runningExecutionId.value)
+    ElMessage.success(res.data?.message || '已发送终止信号')
+  } catch (error) {
+    const msg = error.response?.data?.message || error.message || '终止失败'
+    ElMessage.error(msg)
+  } finally {
+    aborting.value = false
   }
 }
 
@@ -1429,6 +1476,8 @@ const pollExecutionResult = async (executionId) => {
       }
       resultActiveTab.value = 'logs'
       showSteps.value = false
+      // 记录本次 poll 对应的执行 id，供「停止执行」使用
+      runningExecutionId.value = executionId
       if (TERMINAL.includes(lastData.status)) break
     } catch (e) {
       // 轮询失败不中断，等待下次重试
@@ -1450,6 +1499,9 @@ const pollExecutionResult = async (executionId) => {
   showSteps.value = false
   if (isSuccess) {
     ElMessage.success('测试用例执行成功')
+  } else if (lastData?.error_message && lastData.error_message.includes('中止')) {
+    // 人工中止不是缺陷，用 warning 而不是 error，避免误判成用例有问题
+    ElMessage.warning('执行已中止，已完成步骤的结果已保留')
   } else {
     ElMessage.error(`测试用例执行失败（${finalStatus === 'failed' ? '步骤执行失败' : '执行异常'}）`)
   }

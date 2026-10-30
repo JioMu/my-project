@@ -538,6 +538,18 @@ const routes = [
         path: 'element-picker',
         name: 'ElementPicker',
         component: () => import('@/views/ui-automation/ElementPicker.vue')
+      },
+      {
+        // APK 智能回归（MVP）：APK 上传 → REA 分析 → 人工确认 → Midscene 执行 → HTML 报告
+        path: 'apk-regression',
+        name: 'ApkRegression',
+        component: () => import('@/views/ui-automation/ai/ApkRegression.vue')
+      },
+      {
+        // AI 智能模式专属模型配置（独立表，与 /configuration/ai-mode 互不影响）
+        path: 'model-config',
+        name: 'AiModeModelConfig',
+        component: () => import('@/views/ui-automation/ai/AiModeModelConfig.vue')
       }
     ]
   },

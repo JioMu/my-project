@@ -34,13 +34,14 @@ from .midscene_web_engine import (
     _resolve_model_family,
     _to_data_url,
 )
-from .popup_handler import dismiss_popups, PopupAdapter
+# 随机弹窗的自动处理，与 Android 引擎共用 popup_handler。
+# ⚠️ 开关与策略统一在 popup_handler 定义（单一事实源），这里只引用，
+#    否则改一处不生效（Android/iOS 行为会不一致）。
+from .popup_handler import (  # noqa: E402
+    dismiss_popups, PopupAdapter, POPUP_AUTO_DISMISS,
+)
 
 logger = logging.getLogger(__name__)
-
-# 随机弹窗的自动处理，与 Android 引擎共用 popup_handler。
-# 设 POPUP_AUTO_DISMISS=0 可关闭（专门测弹窗的用例需要）。
-POPUP_AUTO_DISMISS = os.environ.get('POPUP_AUTO_DISMISS', '1') not in ('0', 'false', 'False', '')
 POPUP_RETRY_LIMIT = int(os.environ.get('POPUP_RETRY_LIMIT', '2') or 2)
 
 #: 断言的弹窗重试次数比操作类多一些（见 execute_steps 中的说明）。

@@ -1,9 +1,15 @@
 <template>
   <div class="ai-mode-config">
     <div class="page-header">
-      <h1>🧠 AI智能模式配置</h1>
-      <p>配置Browser-use执行时的智能模式与模型参数</p>
+      <h1>🧠 AI智能模式配置（全局）</h1>
+      <p>配置 Browser-use / Midscene 的全局模型参数，供需求分析等其它功能使用</p>
     </div>
+    <el-alert type="info" :closable="false" show-icon style="margin-bottom: 16px">
+      <template #title>
+        这是<b>全局</b>配置（旧入口）。AI 智能模式模块（APK 智能回归等）使用独立配置，请到
+        「AI 智能模式 → 模型配置」单独设置，两处互不影响。
+      </template>
+    </el-alert>
 
     <div class="main-content">
       <!-- 配置列表 -->

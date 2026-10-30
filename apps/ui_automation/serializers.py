@@ -40,7 +40,9 @@ class UiProjectCreateSerializer(serializers.ModelSerializer):
 class UiProjectUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = UiProject
-        fields = ('name', 'description', 'status', 'base_url', 'start_date', 'end_date', 'members')
+        # auto_dismiss_popup / popup_precheck：项目级弹窗策略（2026-10-29）
+        fields = ('name', 'description', 'status', 'base_url', 'start_date', 'end_date',
+                  'members', 'auto_dismiss_popup', 'popup_precheck')
 
 
 class LocatorStrategySerializer(serializers.ModelSerializer):
@@ -612,10 +614,12 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
             'test_suite', 'test_suite_name', 'execution_source', 'status',
             'engine', 'browser', 'headless', 'execution_logs', 'step_results', 'error_message',
             'screenshots', 'execution_time', 'started_at', 'finished_at',
+            'abort_requested',
             'created_by', 'created_by_name', 'created_at'
         ]
-        read_only_fields = ['created_by']
-    
+        # abort_requested 只能经 /abort/ 接口置位，不能让客户端直接 PUT 改写
+        read_only_fields = ['created_by', 'abort_requested']
+
     def get_test_suite_name(self, obj):
         """获取测试套件名称"""
         return obj.test_suite.name if obj.test_suite else None
@@ -905,13 +909,18 @@ class AIExecutionRecordSerializer(serializers.ModelSerializer):
             # 全新 AI 探索」——旧代码降级时只置 replay_mode=False，
             # 报告只剩「AI 探索」，用户误判固化没生效。
             'replay_degraded', 'replay_fail_reason',
+            # 多设备并行批次：前端据此把「同一批次的 N 条记录」标成
+            # 「第 1/2 台 · RMX2117」，否则用户会把并行记录当成重复执行
+            # （2026-10-29 反馈"好像输出两条报告"）。
+            'batch_id', 'batch_index', 'batch_total', 'device_name',
         ]
         read_only_fields = ('start_time', 'end_time', 'duration', 'executed_by', 'gif_path',
                             'screenshots_sequence',
                             # 统计字段由引擎/代理写入，不允许客户端篡改
                             'model_calls', 'prompt_tokens', 'completion_tokens',
                             'tokens_estimated', 'replay_mode',
-                            'replay_degraded', 'replay_fail_reason')
+                            'replay_degraded', 'replay_fail_reason',
+                            'batch_id', 'batch_index', 'batch_total', 'device_name')
 
 
 
