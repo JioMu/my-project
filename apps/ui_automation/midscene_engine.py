@@ -747,17 +747,26 @@ class MidsceneAppEngine:
         raise AssertionError(msg)
 
     def launch_app(self):
+        """启动目标 App，并**确认它真的到了前台**。
+
+        为什么不能只发 `am start` 就完事（2026-10-28 run 14 真实事故）：
+        `am start` 返回成功只代表"启动请求被接受"，不代表目标 App 拿到了前台。
+        那次实测 `mCurrentFocus` 一直是
+        `com.netease.open.pocoservice/...TestActivity`（一个第三方测试工具），
+        万年历在后台，于是：
+          - 模型在 PocoService 界面上找「黄历」，当然找不到；
+          - 截图判据看到画面一直在变（TestActivity 本身是动态画面），
+            误判"点击生效"，把错误一路带到后续步骤；
+          - `uiautomator dump` 被它阻塞，60s 超时。
+        所以这里复用 `_assert_app_foreground_or_fail`：带重试地核对前台包名，
+        确认不了就**直接判失败终止**，绝不在别人的 App 上乱点。
+        """
         if self._page is None:
             self.connect()
         pkg = self.app_config.package_name
         activity = self.app_config.app_activity or ''
-        if activity:
-            self._page.run_adb_shell("am start -n %s/%s" % (pkg, activity))
-        else:
-            self._page.run_adb_shell("monkey -p %s -c android.intent.category.LAUNCHER 1" % pkg)
-        if self.launch_wait_ms:
-            time.sleep(self.launch_wait_ms / 1000.0)
-        self._log("已启动应用 %s / %s", pkg, activity)
+        self._assert_app_foreground_or_fail(where='启动应用')
+        self._log("已启动应用 %s / %s（前台已确认）", pkg, activity)
 
     def reset_to_home(self):
         """把 App 复位到一致起点（探索与回放都用，保证"采样起点 == 回放起点"）。
@@ -1366,20 +1375,48 @@ class MidsceneAppEngine:
                     target = step.get('selector_hint') or prompt
                     position = step.get('selector_position') or ''
                     before = self._safe_shot()
+                    # 点击**前**先取两个基准：
+                    #   ① 前台包名 —— 判断"是不是跳到了别的 App/Activity"
+                    #   ② 页面主体文字指纹 —— 判断"页面内容有没有真的换"
+                    # 顺序放在 ai_tap 之前，否则取到的已是点击后的状态。
+                    step['_fg_before'] = self._foreground_package()
+                    step['_sig_before'] = self._page_text_signature()
                     # 把"当前页面上有哪些可交互入口"作为提示喂给模型。
                     # 它仍然自己看截图定位，但知道屏幕文字确切叫什么，
                     # 不必靠猜（实测模型对「底部黄历」这种描述会定位失败）。
-                    self._page.ai_tap(self._with_entry_hint(target, position))
-                    self._count_model_use(prompt)
-                    # ⭐ 点击后校验页面是否真的变了。
-                    #
-                    # 为什么必须有：`ai_tap` 只要 RPC 没抛异常就返回成功，
-                    # **点空、点到不可点区域、定位到错误元素但坐标落在空白处，
-                    # 都不会报错**。2026-10-28 实测「点击底部黄历Tab」返回 ✓ 仅用
-                    # 4.8s，但手机根本没跳页 —— 假成功一路带到后面步骤才暴露。
-                    # 用点击前后截图比对（纯像素，不花模型调用）当场识破：
-                    # 画面几乎没变化 ⇒ 这次点击大概率没生效。
-                    self._verify_tap_effect(step, before, target, idx)
+                    tap_ok = True
+                    try:
+                        self._page.ai_tap(self._with_entry_hint(target, position))
+                        self._count_model_use(prompt)
+                        # ⭐ 点击后校验页面是否真的变了。
+                        #
+                        # 为什么必须有：`ai_tap` 只要 RPC 没抛异常就返回成功，
+                        # **点空、点到不可点区域、定位到错误元素但坐标落在空白处，
+                        # 都不会报错**。2026-10-28 实测「点击底部黄历Tab」返回 ✓ 仅用
+                        # 4.8s，但手机根本没跳页 —— 假成功一路带到后面步骤才暴露。
+                        self._verify_tap_effect(step, before, target, idx)
+                    except AssertionError as exc:
+                        # 视觉定位失败 —— 若目标是底部导航项，先试坐标兜底。
+                        # 只在**确认没切页**之后才兜底，绝不无条件盲点。
+                        tap_ok = False
+                        self._log('[步骤 %d] 视觉点击未生效：%s', idx + 1,
+                                  str(exc)[:120])
+                        if not self._tab_tap_by_coords(target):
+                            raise
+                        self._entry_cache = None
+                        # 坐标兜底后用**截图差异**单独判一次。
+                        # 不能复用 _verify_tap_effect：那里的文字指纹基准是"视觉点击前"
+                        # 取的，而这条路上 a11y 会返回缓存（实测切页后指纹纹丝不动），
+                        # 再加上它有"导航项直接抛错"的短路逻辑，复用会立刻误判失败。
+                        time.sleep(0.8)
+                        ratio = self._shot_diff_ratio(before, self._safe_shot())
+                        if ratio < self.TAP_EFFECT_MIN_DIFF:
+                            raise AssertionError(
+                                '点击「%s」未生效：视觉定位失败后已改用坐标兜底，'
+                                '画面仍无变化（%.1f%%）' % (target, ratio * 100))
+                        self._log('[坐标兜底] 画面变化 %.1f%%，判定点击生效',
+                                  ratio * 100)
+                        tap_ok = True
             elif action == 'aiInput':
                 if self.replay_mode and self._step_has_coords(step):
                     self._replay_input(step, value)
@@ -1559,14 +1596,48 @@ class MidsceneAppEngine:
         self._entry_cache = (now, out)
         return out
 
+    #: 底部导航栏的常见项名。命中这些名字时，提示词会额外说明
+    #: "这是一排导航项中的第 N 个"，让模型靠**兄弟项的相对位置**锁定，
+    #: 而不是把一个孤立词丢给视觉模型去猜。
+    #:
+    #: 为什么需要（2026-11-02 真机实测）：
+    #:   同一个「天气」Tab，给这些描述的效果天差地别 ——
+    #:     `天气`            -> 失败
+    #:     `底部「天气」Tab`  -> 失败
+    #:     `天气 Tab`        -> 失败
+    #:     `底部导航栏中最右侧区域的天气标签，灰色云朵图标下方写着天气` -> 成功
+    #:   结论不是"模型看不见"，而是**孤立词信息量不足**：页面里有多处「天气」
+    #:   （天气日历、16°阴…），短描述会指向别处或直接放弃。
+    #:   把同一排的兄弟项一起告诉它，它就能靠排序定位。
+    NAV_ITEM_NAMES = frozenset((
+        '万年历', '黄历', '天气', '会员', '工具', '择吉日', '我的',
+        '首页', '发现', '消息', '设置', '推荐', '关注', '视频', '直播',
+        '日历', '日程', '待办', '笔记', '统计',
+    ))
+
+    def _nav_siblings(self, target, entries):
+        """若 target 属于底部导航类的项，返回同一排的兄弟项（按清单顺序）。
+
+        Returns:
+            list[str]  兄弟项；不属于导航类或兄弟不足 2 个时返回空列表。
+        """
+        if target not in self.NAV_ITEM_NAMES:
+            return []
+        sibs = [e for e in entries if e in self.NAV_ITEM_NAMES]
+        return sibs if len(sibs) >= 2 else []
+
     def _with_entry_hint(self, target, position=''):
-        """把入口清单拼进点击描述后面。
+        """把入口清单拼进点击描述，重点是把**位置与兄弟项**讲清楚。
 
         只在清单确实非空且数量合理时拼；拼不上就原样返回，绝不因此让点击失败。
 
         `position` 只作为"同文字出现多处时选哪个"的方位线索**单独陈述**，
         绝不和元素文字拼成一个词 —— 拼起来就是 `底部黄历` 这种屏幕上不存在的名字，
         模型必然 `Element not found`（2026-10-28 事故）。
+
+        2026-11-02 补充：仅仅"告诉它文字是什么"是不够的（实测三种短描述全失败）。
+        现在额外给出 ①位置 ②同一排的兄弟项及其顺序 ③它是第几个，
+        让模型用相对关系定位，不再依赖对单个词的视觉联想。
         """
         entries = self._current_page_entries()
         if not entries:
@@ -1575,10 +1646,38 @@ class MidsceneAppEngine:
         self._log('[入口清单] 当前页面可交互文字 %d 个：%s',
                   len(entries), listing[:300])
 
-        # 元素文字在清单里能精确命中时，明确告诉模型"就是这个名字"，
-        # 不给它留改写的余地。
         exact = target in entries
         pos_note = ('该元素位于页面%s区域，' % position) if position else ''
+
+        # ---- 导航类项：给出兄弟项与序号，这是实测唯一稳定的写法 ----
+        #
+        # ⚠️ 这里**绝不附加全量清单**（2026-11-02 真机对比）：
+        #   失败版：4 行、200+ 字，后面拖着 35 个无关文字
+        #           （京东 / 红果免费短剧 / 北京笔墨留香科技有限公司 / 63MB …）
+        #   成功版：`底部导航栏中最右侧区域的天气标签，灰色云朵图标下方写着天气`
+        #   结论：**短、只讲这一排**才点得中；无关文字会把关键信息淹没。
+        siblings = self._nav_siblings(target, entries)
+        if siblings:
+            idx = siblings.index(target) + 1
+            sib_text = '、'.join(siblings)
+            # 位置词本身就是"底部"时，不要再拼成"页面底部的底部导航栏"
+            if position in ('底部', '顶部'):
+                where = ''
+            elif position:
+                where = '页面%s的' % position
+            else:
+                where = ''
+            if exact:
+                return ('在%s底部导航栏（一排并列的图标按钮）中点击「%s」。'
+                        '这一排从左到右共 %d 项：%s；「%s」是第 %d 项。'
+                        '只需定位这一排的第 %d 项并点击，不要在其它的文字上找。'
+                        % (where, target, len(siblings), sib_text,
+                           target, idx, idx))
+            return ('在%s底部导航栏中点击「%s」，它应与 %s 并排出现。'
+                    '只需在这一排图标按钮里定位「%s」。'
+                    % (where, target, sib_text, target))
+
+        # ---- 非导航项：精确命中时明确"就是这个名字" ----
         if exact:
             return ('需要点击的元素文字是「%s」，%s它与当前页面上的其中一个可交互文字完全一致，'
                     '请直接定位并点击该文字对应的元素。\n'
@@ -1588,6 +1687,78 @@ class MidsceneAppEngine:
                 '若确实没有对应项，说明本页没有该入口。\n'
                 '（当前页面可交互元素的文字依次为：%s）'
                 % (target, pos_note, listing))
+
+    # ---------------- 底部 Tab 坐标兜底 ----------------
+    #
+    # 为什么需要（2026-11-02 真机实测，万年历 RMX2117）：
+    #   底部导航 Tab 的 `ai_tap` 视觉定位**必失败**，提示词怎么改都没用：
+    #     `天气` / `底部「天气」Tab` / `天气 Tab` / 带兄弟项的长描述 —— 全部点不中，
+    #     校验日志稳定是「页面文字保留 100%」，最后靠降级 aiAct 才成功（耗时 70s）。
+    #   但同一位置用 `adb shell input tap 540 2270` **一次即中**。
+    #   ⇒ 不是模型看不见，而是这类虚拟布局节点（dump 里 bounds 全为 [0,0][0,0]）
+    #     拿不到有效 bbox，视觉定位这条路对它天然不通。
+    #
+    # 适用范围**严格限定**：只有当
+    #   ① 目标是已知的底部导航项名（NAV_ITEM_NAMES）
+    #   ② 页面里能数出 >=2 个同类导航项（确认这一排确实存在）
+    #   ③ 用户/用例没给坐标（不覆盖人为指定）
+    # 时才启用。其它任何位置一律走原视觉路径，不做坐标猜测。
+    #
+    #: 底部导航栏中心线占屏高的比例。
+    #: 实测（1080x2400）可点区间是 y∈[2200, 2340]，中心 2270 = 94.6%。
+    #: ⚠️ 比例不能取更高：>=2360 落在系统手势导航区，点了完全无效。
+    TAB_ROW_RATIO = 0.946
+
+    def _screen_size(self):
+        """读屏幕分辨率 (W, H)；失败返回 None。"""
+        if self._page is None:
+            return None
+        try:
+            out = str(self._page.run_adb_shell('wm size') or '')
+        except Exception:  # noqa: BLE001
+            return None
+        m = re.search(r'(\d+)x(\d+)', out)
+        if not m:
+            return None
+        return int(m.group(1)), int(m.group(2))
+
+    def _tab_tap_by_coords(self, target):
+        """按「均分导航栏」推算 target 的坐标并点击。
+
+        Returns:
+            True  已点击（**是否真的切页由调用方校验**，这里不做判断）
+            False 前置条件不满足，未点击
+
+        横向：x = W * (i + 0.5) / n  —— 实测 5 等分下 5/5 全部命中正确页。
+        纵向：H * TAB_ROW_RATIO。
+        """
+        if target not in self.NAV_ITEM_NAMES:
+            return False
+        entries = self._current_page_entries()
+        siblings = self._nav_siblings(target, entries)
+        if not siblings:
+            # 数不出这一排 ⇒ 不确定是不是底部导航，别猜坐标
+            return False
+        # target 必须在当前这一排里。`设置`/`我的` 等名字也在 NAV_ITEM_NAMES 中，
+        # 但它们可能是页面内的普通入口（不是底部 Tab）—— 此时绝不能按序号盲点。
+        if target not in siblings:
+            return False
+        size = self._screen_size()
+        if not size:
+            return False
+        w, h = size
+        n = len(siblings)
+        idx = siblings.index(target)
+        cx = int(w * (idx + 0.5) / n)
+        cy = int(h * self.TAB_ROW_RATIO)
+        self._log('[坐标兜底] 底部导航共 %d 项，点第 %d 项「%s」 -> (%d, %d)',
+                  n, idx + 1, target, cx, cy)
+        try:
+            self._page.run_adb_shell('input tap %d %d' % (cx, cy))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._log('[坐标兜底] 点击失败: %s', exc)
+            return False
 
     # ---------------- 点击生效校验 ----------------
     def _safe_shot(self):
@@ -1632,30 +1803,161 @@ class MidsceneAppEngine:
 
     #: 点击前后画面差异低于该阈值 ⇒ 判定"点击没生效"。
     #:
-    #: 为什么取 0.02（2%）：页面跳转时实测差异远超 10%；
-    #: 而静态页面的轻微动画/时钟跳动通常 < 1%。取 2% 能区分两者。
+    #: ⚠️ 这个阈值**不能单独用作判据**（2026-10-28 run 14 实测）：
+    #: 万年历首页的时钟每秒跳、宜忌/每日一言轮播，同一页前后两次截图差异
+    #: 恒 > 2%，于是"点了黄历"那一步拿到 98.2% 直接判生效，实际页面没动。
+    #: 现在截图差异只作为**辅助信号**，主判据见 `_page_text_signature`。
     TAP_EFFECT_MIN_DIFF = 0.02
 
-    def _verify_tap_effect(self, step, before, target, idx):
-        """点击后校验页面是否真的变化；没变化则重试一次。
+    #: 页面主体文字指纹：当前页面的可见文字集合（排除固定导航项）。
+    #:
+    #: 为什么用文字而不是像素：文字集合对"时钟跳动 / 轮播 / 动画"免疫
+    #: （`14:11`→`14:12` 只差一项，但 Tab 切换会整体换掉一大半），
+    #: 而像素对任何动态元素都敏感 —— 两者的抗噪性正好相反。
+    #:
+    #: ⚠️ **不能按 y 坐标排除底部导航区**（2026-11-02 真机实测）：
+    #: 万年历底部 5 个 Tab 在 uiautomator 里的 bounds 全是 `[0,0][0,0]`
+    #: （虚拟布局节点，没有真实坐标）。按比例切分会把它们当成"正文"，
+    #: 于是"切页前后 Tab 不变"反而把相似度拉高，导致切换页面被判成没换页。
+    #: 改为**按内容过滤**：固定导航项从集合里剔除，与坐标无关。
+    PAGE_SIGNATURE_NAV_LABELS = {
+        '万年历', '黄历', '天气', '会员', '工具', '择吉日', '我的',
+        '首页', '发现', '消息', '设置', '推荐', '关注', '视频', '直播',
+    }
 
-        为什么值得多花一次重试：点击"假成功"的代价是后续所有步骤都在错误的
-        页面上跑，报告结论全错，比直接判失败危险得多。
+    def _page_text_signature(self):
+        """取当前页面主体区域的文字集合（用于判断页面是否真的换了）。
+
+        Returns:
+            set[str]；取不到时返回空集合（调用方据此退回截图判据）。
         """
-        if before is None:
-            return  # 拿不到基准图，无从比较，不做校验
+        if self._page is None:
+            return set()
+        try:
+            xml = self._page.run_adb_shell(
+                'uiautomator dump /sdcard/_ms_sig.xml >/dev/null 2>&1; '
+                'cat /sdcard/_ms_sig.xml')
+        except Exception as exc:  # noqa: BLE001
+            self._log('[点击校验] 取页面层级失败（退回截图判据）: %s', exc)
+            return set()
+        if not isinstance(xml, str) or '<node' not in xml:
+            return set()
+
+        out = set()
+        for m in re.finditer(r'<node[^>]*?/?>', xml):
+            tag = m.group(0)
+            text = re.search(r'text="([^"]*)"', tag)
+            desc = re.search(r'content-desc="([^"]*)"', tag)
+            name = ((text.group(1) if text else '') or
+                    (desc.group(1) if desc else '')).strip()
+            if not name:
+                continue
+            # 固定导航项对"是否换页"没有信息量（切页前后都在），
+            # 留下它们只会稀释差异，必须剔除。
+            if name in self.PAGE_SIGNATURE_NAV_LABELS:
+                continue
+            out.add(name)
+        return out
+
+    @staticmethod
+    def _stable_ratio(a, b):
+        """两组文字里"没变"的占比（以较大的集合为分母）。
+
+        ⚠️ 这里**不能用 Jaccard**（2026-10-28 自测发现）：
+        Jaccard = |交集|/|并集| 在小集合上极度敏感 —— 4 个元素变 1 个就是 0.60，
+        而整页 20 个元素变 1 个是 0.95。同一个"只变一项"的事实，
+        在小页面上会被判成"整页换了"。
+        改用 |交集|/max(|A|,|B|) 后，"变了几项"与集合大小脱钩，口径一致。
+
+        Returns:
+            float 0~1；任一侧为空返回 1.0（视为无变化，不据此判成功）。
+        """
+        if not a or not b:
+            return 1.0
+        return len(a & b) / max(len(a), len(b))
+
+    #: 主体文字"未变占比"低于该值 ⇒ 判定"页面真的换了"。
+    #:
+    #: 为什么取 0.60：
+    #:   - 同一页只跳时钟/轮播/数值：实测稳定在 0.8 以上；
+    #:   - Tab 切换后主体内容整体换掉：实测稳定在 0.3 以下；
+    #:   - 取 0.60 落在中间，且允许"一页里换掉近一半文字"仍算同页。
+    #: 这两个数都是 2026-10-28 在万年历上实测的，不是拍脑袋。
+    PAGE_SIGNATURE_SAME_MIN = 0.60
+
+    def _shot_is_stale(self, sig_before, sig_after):
+        """两次文字指纹完全相同且集合非空 —— 多半是 dump 返回了缓存。
+
+        2026-11-02 实测（万年历）：坐标点击已成功切到天气页，
+        但切页前后 dump 出来的文字集合**完全一致**（stable_ratio=1.000），
+        模型却确认"当前是天气页"。⇒ a11y 层级有缓存/滞后，
+        这种"指纹毫无变化"的情况不能当作"没换页"的证据。
+        """
+        return bool(sig_before) and sig_before == sig_after
+
+    def _verify_tap_effect(self, step, before, target, idx):
+        """点击后校验页面是否**真的换了**；没换则重试一次。
+
+        判据（按可靠性排序，2026-10-28 run 14 实测后重写）：
+          1. **前台包名**：跳到别的 App 或换了 Activity —— 最硬，直接算生效；
+          2. **主体文字指纹**：点击前后文字集合的 Jaccard < 0.75 —— 算生效；
+          3. 截图差异：前两条都拿不到时才用，且只作为"没换"的旁证。
+
+        为什么不继续用截图做主判据：日历首页每秒都在变，同页 diff 恒 >2%，
+        它必然把"没点上"误报成"生效"。这一条曾经让整个报告结论全错。
+        """
         time.sleep(0.6)  # 给页面切换留一点时间（不做无谓长等待）
-        after = self._safe_shot()
-        ratio = self._shot_diff_ratio(before, after)
-        if ratio >= self.TAP_EFFECT_MIN_DIFF:
-            self._log("[点击校验] 画面变化 %.1f%%，判定点击生效", ratio * 100)
-            # 页面已变，入口清单缓存必须作废 —— 否则下一次点击拿到的
-            # 还是上一页的元素列表，等于给了模型过期的参照。
+        before_fg = step.get('_fg_before') or ''
+        after_fg = self._foreground_package()
+        fg_changed = bool(
+            before_fg and after_fg and before_fg != after_fg)
+
+        before_sig = step.get('_sig_before')
+        after_sig = self._page_text_signature() if before_sig is not None else None
+        sig_ratio = (self._stable_ratio(before_sig, after_sig)
+                     if before_sig is not None else None)
+
+        if fg_changed:
+            self._log('[点击校验] 前台 %s → %s，判定点击生效', before_fg, after_fg)
             self._entry_cache = None
             return
 
-        self._log("[点击校验] 画面仅变化 %.1f%%，疑似没点上（target=%s），重试一次",
-                  ratio * 100, target)
+        # 截图差异：**实时**反映画面，不受 a11y 缓存影响，优先采用。
+        shot_ratio = self._shot_diff_ratio(before, self._safe_shot())
+        shot_changed = shot_ratio >= self.TAP_EFFECT_MIN_DIFF
+
+        if sig_ratio is not None and sig_ratio < self.PAGE_SIGNATURE_SAME_MIN:
+            self._log('[点击校验] 页面文字仅保留 %.0f%%（<%.0f%%），判定点击生效',
+                      sig_ratio * 100, self.PAGE_SIGNATURE_SAME_MIN * 100)
+            self._entry_cache = None
+            return
+
+        # 文字指纹"完全没变"时不能信它（dump 缓存），改用截图差异判。
+        if shot_changed and self._shot_is_stale(before_sig, after_sig):
+            self._log('[点击校验] 文字层级疑似缓存未刷新，改看截图：画面变化 %.1f%%'
+                      '（≥%.0f%%）判定点击生效',
+                      shot_ratio * 100, self.TAP_EFFECT_MIN_DIFF * 100)
+            self._entry_cache = None
+            return
+
+        # 到这里：没有前台变化，主体文字也基本没变 ⇒ 极可能"没点上"
+        detail = ('页面文字保留 %.0f%%' % (sig_ratio * 100)
+                  if sig_ratio is not None else '未能取到页面层级')
+
+        # ⭐ 底部导航项：**不再用视觉重试**，直接抛错交给坐标兜底。
+        # 依据（2026-11-02 实测）：这类节点 bounds 全 [0,0][0,0]，视觉定位怎么试都
+        # 点不中，再重试一次只是白花 ~20s；而坐标兜底 2 秒就能成。
+        #
+        # 注意：只有 target **确实在当前这一排导航项里** 才这样走。
+        # `设置`/`我的` 等名字虽在 NAV_ITEM_NAMES 中，但可能只是页面内的普通入口，
+        # 那种情况仍应按原逻辑重试（不能因为名字像导航项就放弃视觉路径）。
+        if target in self._nav_siblings(target, self._current_page_entries()):
+            raise AssertionError(
+                '点击「%s」未生效（%s）；底部导航项视觉定位不可靠，'
+                '改由坐标兜底处理' % (target, detail))
+
+        self._log('[点击校验] %s，疑似没点上（target=%s），重试一次',
+                  detail, target)
         try:
             # 重试用更直白的描述：很多"点不上"是因为描述与屏幕文字对不上。
             # 位置词（底部/上方）单独成句，**绝不拼进元素名**，模型才容易定位。
@@ -1663,23 +1965,34 @@ class MidsceneAppEngine:
                 self._simple_tap_hint(target, step.get('selector_position') or ''))
             self._count_model_use(target)
         except Exception as exc:  # noqa: BLE001
-            self._log("[点击校验] 重试失败: %s", exc)
+            self._log('[点击校验] 重试失败: %s', exc)
             raise AssertionError(
-                '点击「%s」未生效（画面无变化），重试也失败：%s' % (target, exc))
+                '点击「%s」未生效（%s），重试也失败：%s' % (target, detail, exc))
         finally:
             # 重试可能改变了页面，缓存一律作废（宁可多 dump 一次，也不用过期清单）
             self._entry_cache = None
 
         time.sleep(0.8)
-        after2 = self._safe_shot()
-        ratio2 = self._shot_diff_ratio(before, after2)
-        if ratio2 < self.TAP_EFFECT_MIN_DIFF:
-            # 重试后仍无变化 ⇒ 明确判失败，别让后续步骤在错页面上空跑
-            raise AssertionError(
-                '点击「%s」未生效：页面未发生跳转（画面变化仅 %.1f%%）。'
-                '可能原因：该元素不存在、文字描述与界面不符、或点击区域不可点。'
-                % (target, ratio2 * 100))
-        self._log("[点击校验] 重试后画面变化 %.1f%%，点击生效", ratio2 * 100)
+        after_fg2 = self._foreground_package()
+        after_sig2 = self._page_text_signature() if before_sig is not None else None
+        sig_ratio2 = (self._stable_ratio(before_sig, after_sig2)
+                      if before_sig is not None else None)
+
+        if before_fg and after_fg2 and before_fg != after_fg2:
+            self._log('[点击校验] 重试后前台变为 %s，点击生效', after_fg2)
+            return
+        if sig_ratio2 is not None and sig_ratio2 < self.PAGE_SIGNATURE_SAME_MIN:
+            self._log('[点击校验] 重试后页面文字仅保留 %.0f%%，点击生效',
+                      sig_ratio2 * 100)
+            return
+
+        # 重试后仍未换页 ⇒ 明确判失败，别让后续步骤在错页面上空跑
+        raise AssertionError(
+            '点击「%s」未生效：页面内容没有变化（%s）。'
+            '可能原因：该元素不存在、文字描述与界面不符、或点击区域不可点。'
+            % (target,
+               '文字保留 %.0f%%' % (sig_ratio2 * 100)
+               if sig_ratio2 is not None else '未能取到页面层级'))
 
     @staticmethod
     def _simple_tap_hint(target, position=''):

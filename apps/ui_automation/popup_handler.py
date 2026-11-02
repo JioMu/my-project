@@ -22,6 +22,7 @@ iOS（midscene_ios_engine）共用，行为保持一致。
 from __future__ import annotations
 
 import os
+import re
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +172,20 @@ def _normalise(answer) -> str:
         return ''
     # "none" 开头的长句子通常是解释，不是按钮名
     if lowered.startswith('none'):
+        return ''
+
+    # 去掉模型随手带上的**编号/序号**（2026-11-02 真机实测）：
+    # 问"有弹窗吗、点哪个按钮关闭"，模型答 `跳过 1` —— 前面是按钮名，后面是它自己对
+    # 候选列表的编号。原样拿去 ai_tap 会去找一个屏幕上不存在的"跳过 1"，必然点空，
+    # 表现为「检测到了弹窗但 closed=0」，用户看到的就是"勾了自动处理弹窗却没效果"。
+    # 只剥尾部的编号（不碰 "5分钟后" 这类有语义的内容）。
+    # 带单位后缀的也要剥：真机实测出现过 `跳过 1s`（编号 + 秒数混在一起），
+    # 只认纯数字会漏，于是又去找一个屏幕上不存在的"跳过 1s"。
+    text = re.sub(r'\s+\d{1,2}[sS]?$', '', text).strip()
+    if not text:
+        return ''
+    lowered = text.lower()
+    if lowered in _ANSWER_REJECT:
         return ''
     return text
 

@@ -6615,6 +6615,14 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
             except Exception as exc:  # noqa: BLE001
                 adb_cache[host] = (None, str(exc))
                 return adb_cache[host]
+            # adb 自身启动失败（如冒号端口写错、服务不可用）时 rc!=0 且 stdout 为空。
+            # 此时**必须报"adb 不可用"而不是"未找到序列号"** —— 后者会把
+            # "连不上 adb 服务"误诊成"手机没插好"，排查方向完全跑偏。
+            if proc.returncode != 0 and not (proc.stdout or '').strip():
+                adb_cache[host] = (None, 'adb devices 执行失败：%s'
+                                   % ((proc.stderr or '').strip()[:200] or 'rc=%s'
+                                      % proc.returncode))
+                return adb_cache[host]
             states = {}
             for line in (proc.stdout or '').splitlines():
                 line = line.strip()
@@ -6686,10 +6694,17 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                 })
                 continue
             if device.platform == 'android':
+                # ⚠️ **端口一律保留**（2026-11-02 真实 bug，踩过一次错修）：
+                # 曾经这里会把 `host:port` 剥成裸 host，理由是"5037 是默认端口"。
+                # 这个假设是错的 —— `ADB_SERVER_SOCKET` 写成 `tcp:host`（缺端口）时，
+                # adb **不回落到 5037，而是回落到 5555**，直接报
+                #   `failed to connect to 'host.docker.internal:5555': Connection refused`
+                #   `* cannot start server on remote host`
+                # 于是 states 恒为空 ⇒ 判定「adb devices 中未找到该序列号」，
+                # 设备在页面上永远离线，而同一台设备 probe_device_reachable
+                # 用 `-H/-P` 传了端口所以是通的 —— 两个入口结论打架，
+                # 用户看到的就是「设备已经连上了 但是说未找到」。
                 host = (device.adb_host or '').strip()
-                # 兼容历史数据里写成 host:port 的形式
-                if host and host.count(':') == 1 and host.rsplit(':', 1)[1].isdigit():
-                    host = host.rsplit(':', 1)[0]
                 states, err = _adb_devices(host)
                 if states is None:
                     online, detail = False, 'adb 不可用：%s' % err

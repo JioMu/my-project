@@ -115,6 +115,25 @@ _LAUNCH_STEP = re.compile(
 _COMPOSITE_CHAIN = re.compile(r'(?:然后|随后|接着|之后再|再点击|再点)')
 
 
+#: 「条件句」判据：动作是否发生取决于当前界面状态。
+#:
+#: 为什么必须单独判（2026-11-02 实测，run 15 步骤 2）：
+#:   步骤写「若出现开屏广告则点击「跳过」按钮」，
+#:   被 `^点击` 规则分派成 aiTap —— 但 aiTap 是**无条件点击**，
+#:   它只会拿「跳过」去截图里找，找不到就抛：
+#:     failed to locate element: （冒号后为空，midscene 原始报错）
+#:   而当时根本没有开屏广告 ⇒ 这一步必然白失败一次，再降级 aiAct 才补救成功，
+#:   实测白花 16 秒，报告里还留下一条吓人的红色错误。
+#:   条件步骤的正确语义是“先判断，再决定动不动”，这正是 aiAct 的能力。
+_CONDITIONAL_STEP = re.compile(
+    r'(?:若|如果|假如|倘若|如遇|如有|如有需要|必要时|按需|视情况|当出现)')
+
+
+def is_conditional_step(text):
+    """判断是否为条件句（动作是否执行取决于界面状态），应走 aiAct。"""
+    return bool(_CONDITIONAL_STEP.search(str(text or '')))
+
+
 def is_composite_step(text):
     """判断是否为复合句（动作+预期结果 / 连续多个动作），必须走 aiAct。"""
     t = str(text or '')
@@ -134,6 +153,11 @@ def classify_step(text):
     # 不能被下面的 aiTap 规则截断成"只点某个控件"。
     if is_composite_step(t):
         return 'aiAct', '含预期结果的复合句'
+    # ⚠️ 条件句同样优先：不能因为句子以"点击"开头就无条件去点。
+    # 「若出现开屏广告则点击跳过」在没有广告时本来就**不该点**，
+    # 强行 aiTap 只会抛 failed to locate element。
+    if is_conditional_step(t):
+        return 'aiAct', '条件句（是否执行取决于界面状态）'
     for action, pattern, label in _STEP_INTENT_RULES:
         if pattern.search(t):
             return action, label

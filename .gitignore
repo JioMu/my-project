@@ -147,3 +147,23 @@ devimages/
 .debug_tmps/
 frontend/_build_out.txt
 frontend/_build_err.txt
+
+# 2026-11-02 补：根目录 `_` 前缀的临时产物本就该忽略，但旧规则只覆盖了 .ps1/.js/.conf，
+# 于是 _after_close.png / _probe_tab_shot.png / _c_ship.sh 这类一直显示为未跟踪。
+/_*.png
+/_*.sh
+/_*.tar
+/_*.log
+/_*.txt
+
+# 一次性调试脚本（排查用，跑完即弃，不进版本库）。
+# 保留 scripts/ 下正式运维脚本（不带 _ 前缀的）。
+/scripts/_*.py
+/scripts/_*.sh
+/scripts/_*.ps1
+/scripts/_*.bat
+/scripts/_*.txt
+
+# 生产备份目录：含 3GB 级 DB dump，绝对禁止入库（但必须留在磁盘上）
+/_backup_*/
+/_db_backup/
