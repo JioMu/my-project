@@ -70,6 +70,49 @@ def _apply_rpc_timeout():
     except Exception as exc:  # noqa: BLE001
         logger.warning('[Midscene] 设置 RPC 超时失败: %s', exc)
 
+
+def _infer_model_family(model_name):
+    """按模型名推断 midscene 的 MIDSCENE_MODEL_FAMILY（两条配置路径共用）。
+
+    为什么必须有（2026-11-02 生产事故）：
+      「AI 用例管理」走 legacy 路径读 `AIModelConfig`，而**该表根本没有
+      model_family 字段**。旧代码 `getattr(cfg, 'model_family', '') or ''`
+      永远拿到空串 ⇒ connect() 不设置环境变量 ⇒ midscene 回退默认值 `openai`
+      ⇒ 每次模型调用都抛：
+        Invalid MIDSCENE_MODEL_FAMILY value: openai.
+        Current version v1.8.7 accepts: doubao-vision, doubao-seed, gemini,
+        qwen2.5-vl, qwen3-vl, qwen3.5, qwen3.6, vlm-ui-tars, ..., gpt-5
+      表现是整条用例的每个步骤连续失败，且错误一模一样。
+
+    取舍：宁可给纯文本模型也猜一个多模态 family（最多浪费一次调用），
+    也不要返回空 —— 空会让整个链路直接崩。
+
+    Returns:
+        str 合法 family；无法判断时返回空串（调用方按需处理）
+    """
+    mn = str(model_name or '').strip().lower()
+    if not mn:
+        return ''
+    if 'qwen' in mn:
+        # qwen3.x-plus / qwen3-vl / qwen2.5-vl / qwen-vl / *-omni-*
+        # 注意：qwen3.x 系列（含 qwen3.7-plus）实测走 qwen3-vl 口径可用
+        if 'qwen2' in mn:
+            return 'qwen2.5-vl'
+        return 'qwen3-vl'
+    if 'glm' in mn:
+        return 'glm-v'
+    if 'gemini' in mn:
+        return 'gemini'
+    if 'doubao' in mn or 'seed' in mn:
+        return 'doubao-vision'
+    if 'ui-tars' in mn:
+        return 'vlm-ui-tars'
+    if mn.startswith('gpt') or 'gpt-' in mn or 'gpt5' in mn:
+        return 'gpt-5'
+    return ''
+
+
+
 # 坐标/像素写法护栏：用例必须用语义描述，禁止写死坐标，否则换机型必错位
 # 命中规则（兼顾 midscene bbox=[x,y,x,y] 与单点 [x,y]，但尽量不误伤业务数字）：
 #   1) 四个数字（bbox）：\d,\d,\d,\d
@@ -354,7 +397,16 @@ class MidsceneAppEngine:
             'api_key': cfg.api_key,
             'base_url': cfg.base_url,
             'model_name': cfg.model_name,
-            'model_family': getattr(cfg, 'model_family', '') or '',
+            # ⚠️ `AIModelConfig` **没有 model_family 字段**（2026-11-02 生产事故确认）。
+            # 原来写 `getattr(cfg, 'model_family', '') or ''` 永远得空串，于是
+            # connect() 不设置 MIDSCENE_MODEL_FAMILY，midscene 回退默认值 `openai`，
+            # 每次调用都抛：
+            #   Invalid MIDSCENE_MODEL_FAMILY value: openai.
+            #   Current version v1.8.7 accepts: doubao-vision, ..., qwen2.5-vl,
+            #   qwen3-vl, ..., gpt-5
+            # 表现是「AI 用例管理」里所有步骤连续失败（每步都是这一条错误）。
+            # ⇒ 必须按模型名自己推断，与 AiModeModelConfig.resolved_family 同口径。
+            'model_family': _infer_model_family(cfg.model_name),
         }
 
     def _load_ai_mode_config(self) -> dict:
@@ -473,6 +525,18 @@ class MidsceneAppEngine:
             if family:
                 os.environ['MIDSCENE_MODEL_FAMILY'] = family
                 logger.info("[Midscene] 设置 MIDSCENE_MODEL_FAMILY=%s", family)
+            else:
+                # 推断不出 family 时**必须清掉**已有的环境变量。
+                # 环境是进程级的：只要之前某次设置过非法值（例如上游写入 openai），
+                # 后续所有连接都会继承它并稳定报
+                #   Invalid MIDSCENE_MODEL_FAMILY value: openai
+                # 清掉后 midscene 会按自己的默认逻辑处理，比留着一个非法值好。
+                stale = os.environ.pop('MIDSCENE_MODEL_FAMILY', None)
+                if stale:
+                    logger.warning(
+                        "[Midscene] 模型名「%s」推断不出 family，已清除残留的 "
+                        "MIDSCENE_MODEL_FAMILY=%s",
+                        cfg.get('model_name') or '(空)', stale)
             model_config = MidsceneConfig(
                 base_url=cfg.get('base_url') or '',
                 api_key=cfg['api_key'],
