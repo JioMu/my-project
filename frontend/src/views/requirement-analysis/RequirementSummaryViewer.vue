@@ -435,7 +435,16 @@ export default {
       return mod.key_features.map(f => {
         if (typeof f === 'string') return f
         if (f && typeof f === 'object') {
-          return (f.name || f.title || '') + (f.desc || f.description ? ` (${f.desc || f.description})` : '')
+          // 新格式 key_features 用 text 字段（并带 F-xxx 稳定编号）：
+          // {'id':'M1-F001','text':'...','involves_api':true,...}
+          // 老格式是 title/name。缺了 text 会导致功能点在前端显示为空。
+          const body = f.text || f.name || f.title || ''
+          if (!body) return ''
+          const id = typeof f.id === 'string' ? f.id : ''
+          const note = f.desc || f.description
+          const prefix = id ? `${id} ` : ''
+          const suffix = note ? ` (${note})` : (f.involves_api === true ? ' (涉及接口)' : '')
+          return prefix + body + suffix
         }
         return String(f)
       }).filter(Boolean)

@@ -38,6 +38,31 @@
      → ③ 补对照判据（与什么对比）；
    - ❌ 禁止把已有判据改写、概括成「页面展示正常」「各图标与文案展示正确」等兜底句。
 
+8. **⚠️ feature_ref / api_ref 必须无损透传，严禁丢弃**：输入测试点携带的 `feature_ref`、`api_ref`
+   是「功能点↔测试点↔接口契约」的追溯链，一旦在合并环节丢失，后续就无法判断漏测与接口覆盖：
+   - 单条直通：原样复制到输出的同名字段；
+   - 判定重复需合并两条时：取**并集**（`feature_ref` 与 `api_ref` 都去重后合并），不得只保留主条目的值；
+   - 输入为老数据（字段缺失或为空数组）：输出 `[]`，**不得据此判定为漏测**，也不得凭空补 id；
+   - `api_ref` 非空的测试点，其 `pass_criteria` 中的接口级判据必须保留，不得因合并被降级为界面描述。
+
+9. **⚠️ category 必须保真，禁止泛化成 main_flow/branch_flow**：`category` 是覆盖广度指标，
+   一旦把边界/异常/权限/UI 全写成 `branch_flow`，报告里就再也看不出有没有测边界和异常。
+   - 单条直通：**原样复制**输入的 `category`，不得重新判定；
+   - 判定重复需合并两条时：合并后的 category 取**信息量更大**的一方
+     （优先级 exception = boundary = permission > UI > performance > branch_flow > main_flow），
+     例如「异常场景」与「主流程」合并，结果必须是 `exception`，不能写 `main_flow`；
+   - 输入 `category` 为空或缺失时才允许自行判定，且必须按下方规则严格判定，
+     不得一律填 `branch_flow`：
+     | 输入特征 | 应填 category |
+     | --- | --- |
+     | 主流程、正常路径、首次进入、默认展示 | `main_flow` |
+     | 空/超长/特殊字符/上下限/枚举边界 | `boundary` |
+     | 断网/超时/失败重试/服务异常/中断恢复 | `exception` |
+     | 登录态、会员权益、角色差异、越权 | `permission` |
+     | 文案、图标、布局、动画、适配 | `UI` |
+     | 加载耗时、大数据量、内存 | `performance` |
+   - **自检**：合并完成后，若输出的 category 种类少于输入的 70%，视为覆盖被压缩，必须复核后重新输出。
+
 ## 📋 合并步骤
 
 ### 第一步：合并三路输入
@@ -140,6 +165,8 @@ P2 基础点与 P5 风险点、P6 变更点如果验证同一目标（如“动�
       "smoke_candidate": true/false,
       "page_path": "<模块 → 功能 → 页面>",
       "is_smoke_candidate": true/false,
+      "feature_ref": ["<key_features id，并集去重；老数据为空数组>"],
+      "api_ref": ["<api_contracts id，并集去重；无接口为空数组>"],
       "operations_chain": [
         { "order": 1, "operation": "<操作>", "target_page": "<页面>" }
       ]

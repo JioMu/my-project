@@ -272,19 +272,498 @@ def _validate_evidence(value, source_text: str) -> bool:
     return all(q in source for q in quotes)
 
 
-def _ordered_union(left, right):
+def _feature_text(item) -> str:
+    """取 key_features 条目的文本。
+
+    兼容两种形态：
+    1. 新格式（p0 已升级为对象）：{'id': 'F-001', 'text': '...', 'involves_api': True, ...}
+    2. 老格式（裸字符串）：'支持新增状态记录'
+    老数据仍在库里，两种都必须能读，否则模块去重签名会失真、
+    甚至把整个 dict 的 repr 当成功能点文本参与相似度计算。
+    """
+    if isinstance(item, dict):
+        for key in ('text', 'title', 'name', 'description'):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ''
+    if item is None:
+        return ''
+    return str(item).strip()
+
+
+def _feature_dedup_key(item):
+    """key_features 去重用的键：新格式优先用稳定 id，老格式用文本。"""
+    if isinstance(item, dict):
+        fid = item.get('id')
+        if isinstance(fid, str) and fid.strip():
+            return ('id', fid.strip())
+        return ('text', _feature_text(item))
+    return ('text', str(item).strip())
+
+
+def _ordered_union(left, right, key=None):
+    """保序并集。传入 key 时按 key 判重（用于 dict 条目，避免 unhashable / 误判）。"""
     result = []
+    seen = set()
     for item in list(left or []) + list(right or []):
-        if item not in result:
-            result.append(item)
+        if key is not None:
+            if not item:
+                continue
+            marker = key(item)
+            if marker in seen:
+                continue
+            seen.add(marker)
+        elif item in result:
+            continue
+        result.append(item)
     return result
+
+
+# ---------------------------------------------------------------------------
+# feature_ref / api_ref 事后回填
+# ---------------------------------------------------------------------------
+# 为什么用代码回填而不是让模型透传：
+#   阶段3.3.7 三路合并时，combined 只挑选 id/title/description/priority/source/
+#   pass_criteria 六个字段送给 P7（见 run_design_phase1），feature_ref / api_ref
+#   在这一步就被丢弃，P7 提示词里写再多"必须无损透传"也执行不到。
+#   模型复述 id 也不可靠（会改写/漏写），所以改为在落库前用代码建立
+#   「测试点 ↔ 功能点 / 接口契约」的关联，结果可重复、可解释。
+
+_FEATURE_REF_MIN_SIM = 0.34     # 低于该相似度视为未命中，留空待人工
+_FEATURE_REF_MARGIN = 0.06      # 次优与最优太接近时视为歧义，留空
+
+
+def _ref_tokens(text: str) -> set:
+    """中文 2-gram + 英文/数字串，用于轻量相似度（不依赖 embedding）。"""
+    s = re.sub(r'\s+', '', str(text or ''))
+    if not s:
+        return set()
+    grams = {s[i:i + 2] for i in range(len(s) - 1)}
+    grams |= set(re.findall(r'[A-Za-z0-9_]{2,}', s))
+    return grams
+
+
+def _ref_similarity(a: set, b: set) -> float:
+    """以较短一方为分母的覆盖率，偏好"被测文本包含功能点语义"。"""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def _collect_feature_index(summary_data) -> list:
+    """从阶段1 结构化结果收集功能点索引。
+
+    返回 [{'module','id','text','involves_api'}...]；兼容 key_features 为
+    对象（新格式）或裸字符串（老数据）。
+
+    ⚠️ id 全局唯一化：新提示词产出 `M1-F001` 这类带模块前缀的 id；
+    老数据是模块内 `F-001`，两个模块会重复。这里做一次升格，
+    保证返回的 id 在整个 summary 内唯一 —— 否则下游按 id 匹配会跨模块误挂。
+    """
+    index = []
+    if not isinstance(summary_data, dict):
+        return index
+    modules = [m for m in (summary_data.get('modules') or []) if isinstance(m, dict)]
+    seen = {}
+    for m_idx, m in enumerate(modules, 1):
+        mod_name = str(m.get('name') or '').strip()
+        for pos, item in enumerate(m.get('key_features') or [], 1):
+            text = _feature_text(item)
+            if not text:
+                continue
+            fid = ''
+            api_flag = False
+            if isinstance(item, dict):
+                fid = str(item.get('id') or '').strip()
+                api_flag = item.get('involves_api') is True
+            raw_id = fid  # 原始 id（老数据为模块内 F-001，可能跨模块重复）
+            if not fid:
+                # 老数据没有 id：按模块序号+位置生成
+                fid = 'M%d-F%03d' % (m_idx, pos)
+            elif re.fullmatch(r'F-\d+', fid):
+                # 老数据的裸 id（模块内编号）：**一律**加模块前缀升格为全局唯一。
+                # 不能只处理"重复的那些"——首个模块的 F-001 会保留裸 id，
+                # 与后来升格的 id 混用，仍会跨模块误配。
+                num = int(fid.split('-')[1])
+                fid = 'M%d-F%03d' % (m_idx, num)
+            if fid in seen:
+                # 仍冲突（如两个模块同名且序号相同已被占用）：追加序号兜底
+                base = fid
+                n = 2
+                while fid in seen:
+                    fid = '%s#%d' % (base, n)
+                    n += 1
+            seen[fid] = True
+            index.append({'module': mod_name, 'id': fid, 'raw_id': raw_id,
+                          'text': text, 'involves_api': api_flag})
+    return index
+
+
+def _collect_api_index(summary_data, id_map=None) -> list:
+    """从阶段1 结果的 api_contracts 收集接口索引。
+
+    id_map: {原 feature id -> 升格后的唯一 id}，由 _collect_feature_index 的
+    调用方提供，用于把契约里的 feature_ids 同步改成唯一 id（老数据裸 id 会重复）。
+    """
+    out = []
+    if not isinstance(summary_data, dict):
+        return out
+    id_map = id_map or {}
+    for a in (summary_data.get('api_contracts') or []):
+        if not isinstance(a, dict):
+            continue
+        aid = str(a.get('id') or '').strip()
+        if not aid:
+            continue
+        fids = []
+        for x in (a.get('feature_ids') or []):
+            k = str(x).strip()
+            if not k:
+                continue
+            # 只映射唯一命中的（映射表里一对多时无法判断，原样保留）
+            mapped = id_map.get(k)
+            fids.append(mapped if isinstance(mapped, str) else k)
+        # 接口自身可检索的文本：路径、触发点、字段名
+        parts = [a.get('path') or '', a.get('trigger') or '', a.get('method') or '']
+        for f in (a.get('request_fields') or []):
+            if isinstance(f, dict):
+                parts.append(str(f.get('name') or ''))
+        for f in (a.get('response_fields') or []):
+            if isinstance(f, dict):
+                parts.append(str(f.get('name') or ''))
+        out.append({'id': aid, 'feature_ids': fids,
+                    'text': ' '.join(x for x in parts if x)})
+    return out
+
+
+def backfill_testpoint_refs(test_points, summary_data, page_name='') -> int:
+    """给测试点回填 feature_ref / api_ref（原地修改，返回回填条数）。
+
+    规则（保守，宁缺勿错）：
+      1. 测试点归属模块与功能点模块不同则不匹配 —— 避免跨模块误挂；
+         模块名取"短的那个包含长的"即视为同模块（兼容「运动连胜」vs「运动连胜-日历」）。
+      2. 相似度 = 以功能点分词语料为分母的覆盖率，取最高分；
+         且必须 >= _FEATURE_REF_MIN_SIM，并且比次优高出 _FEATURE_REF_MARGIN，
+         否则视为歧义留空（避免为了"每条都有值"而强行乱挂）。
+      3. api_ref 只从 feature_ref 命中且 involves_api=True 的功能点反查，
+         不额外猜测接口。
+    """
+    feats = _collect_feature_index(summary_data)
+    if not feats or not isinstance(test_points, list):
+        return 0
+
+    # 原 id -> 唯一 id 映射：老数据两个模块都有 F-001 时无法判断契约指哪个模块，
+    # 这种重复原 id 不映射（契约里的引用原样保留，不会误挂到某一侧）。
+    raw_counter = {}
+    for f in feats:
+        raw_counter[f.get('raw_id')] = raw_counter.get(f.get('raw_id'), 0) + 1
+    id_map = {}
+    for f in feats:
+        rid = f.get('raw_id')
+        if rid and rid != f['id'] and raw_counter.get(rid) == 1:
+            id_map[rid] = f['id']
+    apis = _collect_api_index(summary_data, id_map)
+
+    feat_tokens = [(f, _ref_tokens(f['text']), _ref_tokens(f['text']) | {f['id'].lower()})
+                   for f in feats]
+    # feature id -> api ids
+    api_by_feature = {}
+    for a in apis:
+        for fid in a['feature_ids']:
+            api_by_feature.setdefault(fid, []).append(a['id'])
+
+    def same_module(tp_module, feat_module):
+        """判断测试点模块与功能点模块是否同一模块。
+
+        ⚠️ 不能简单用"互相包含"：实测存在「运动连胜」与「运动连胜-日历」这种
+        父子关系模块，且两个模块的 feature id 都从 F-001 起 —— 互相包含会把
+        子模块的测试点挂到父模块同名 id 的功能点上，产生跨模块误挂。
+        规则：归一化后完全相等 → 同模块；一方为空 → 不限制；
+        一方是另一方以固定分隔符切分后的完整前缀/子项 → 才算同族。
+        """
+        def _n(x):
+            return re.sub(r'[\s_/、,，。|·]+', '', str(x or ''))
+
+        a, b = _n(tp_module), _n(feat_module)
+        if not a or not b or a == b:
+            return True
+        # 以原串（保留 '-'）按分隔符切段，要求段序列前缀一致
+        def _segs(x):
+            return [s for s in re.split(r'[\s\-_/、,，。|·]+', str(x or '')) if s]
+        sa, sb = _segs(tp_module), _segs(feat_module)
+        if not sa or not sb:
+            return False
+        short, long_ = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
+        # 只在"短的是长的完整前缀"且短的一方至少 2 段时才认为同族；
+        # 1 段 vs 2 段（如「运动连胜」vs「运动连胜-日历」）属于父子模块，严格区分。
+        return len(short) >= 2 and long_[:len(short)] == short
+
+    filled = 0
+    for tp in test_points:
+        if not isinstance(tp, dict):
+            continue
+        if tp.get('feature_ref') or tp.get('api_ref'):
+            # 模型已经给出（例如降级路径直通），尊重原值
+            continue
+        blob = ' '.join(str(tp.get(k) or '') for k in
+                        ('title', 'description', 'pass_criteria', 'page_path'))
+        t_tokens = _ref_tokens(blob)
+        if not t_tokens:
+            continue
+        tp_mod = tp.get('module')
+
+        def _score(allow_other_modules: bool):
+            out = []
+            for f, f_tokens, f_full in feat_tokens:
+                if not allow_other_modules and not same_module(tp_mod, f['module']):
+                    continue
+                sim = max(_ref_similarity(f_tokens, t_tokens),
+                          _ref_similarity(f_full, t_tokens) * 0.95)
+                if sim > 0:
+                    out.append((sim, f))
+            out.sort(key=lambda x: -x[0])
+            return out
+
+        # 先在本模块内找；找不到再放开模块限制（P7 合并会重写 module 字段，
+        # 实测存在"日历模块的测试点被标成目标模块"的错标，严格按模块过滤会整批漏配）。
+        scored = _score(allow_other_modules=False)
+        relaxed = False
+        if not scored or scored[0][0] < _FEATURE_REF_MIN_SIM:
+            wider = _score(allow_other_modules=True)
+            if wider and (not scored or wider[0][0] > scored[0][0] + _FEATURE_REF_MARGIN):
+                scored, relaxed = wider, True
+        if not scored:
+            continue
+        scored.sort(key=lambda x: -x[0])
+        best_sim, best = scored[0]
+        second = scored[1][0] if len(scored) > 1 else 0.0
+        if best_sim < _FEATURE_REF_MIN_SIM:
+            continue
+        if best_sim - second < _FEATURE_REF_MARGIN:
+            # 歧义：留空，交给人工/前端提示，不硬挂
+            tp['_ref_ambiguous'] = [
+                {'id': f['id'], 'sim': round(s, 3)} for s, f in scored[:3]
+            ]
+            continue
+        tp['feature_ref'] = [best['id']]
+        tp['_feature_ref_sim'] = round(best_sim, 3)
+        # 记录功能点所属模块，便于前端/审计发现 P7 的 module 错标
+        tp['_feature_ref_module'] = best['module']
+        if relaxed:
+            tp['_feature_ref_relaxed'] = True
+        if best['involves_api']:
+            api_ids = api_by_feature.get(best['id']) or []
+            if api_ids:
+                tp['api_ref'] = api_ids
+        filled += 1
+    return filled
+
+
+# ---------------------------------------------------------------------------
+# P0 占比收敛（代码侧硬约束）
+# ---------------------------------------------------------------------------
+# 为什么必须在代码里做：p7 提示词写了「P0 占比 ≤15%」，但没有可靠的执行体
+# —— 实测同一批数据 P0 到 25%~45%，模型会为了"重要"给几乎所有点打 P0。
+# 质量检查 _code_quality_check 里的 C5 也只做 WARNING 检测、不修正数据。
+# 因此改为落库前按配额下调，并把每次降级写进审计字段，人工可复核。
+
+P0_RATIO_LIMIT = 0.15      # P0 上限（与 p7 硬约束 4 / 质量检查 C5 保持一致）
+P0_MIN_KEEP = 3            # 小批量时至少保留的 P0 条数（避免 5 条用例被压成 0 条 P0）
+
+
+def _priority_rank(v) -> int:
+    """P0=0 / P1=1 / P2=2；非法值（如 'P'、空）按 P1 处理。"""
+    s = str(v or '').strip().upper()
+    return {'P0': 0, 'P1': 1, 'P2': 2}.get(s, 1)
+
+
+_CAT_SYNONYMS = {
+    'main_flow': 'main_flow', 'branch_flow': 'branch_flow', 'boundary': 'boundary',
+    'exception': 'exception', 'permission': 'permission', 'ui': 'UI',
+    'performance': 'performance', 'compatibility': 'UI', '兼容': 'UI',
+    '功能': 'main_flow', '主流程': 'main_flow', '边界': 'boundary',
+    '异常': 'exception', '权限': 'permission', '性能': 'performance',
+}
+
+
+def _infer_category(tp) -> str:
+    """推断 category，优先用 type/category 的显式值，其次按标题关键词判定。
+
+    ⚠️ 历史 bug：原实现只查中文 `type`（功能/边界/异常），而 p2 实际输出英文
+    `category` 或英文 `type`，映射全部落空 → 统一回落到 `main_flow`/`branch_flow`，
+    导致 boundary/exception/permission/UI 被整体吞掉（实测某画布 6 类退化到 2 类）。
+    """
+    if not isinstance(tp, dict):
+        return 'branch_flow'
+
+    def _try(v):
+        k = str(v or '').strip()
+        if not k:
+            return None
+        direct = _CAT_SYNONYMS.get(k) or _CAT_SYNONYMS.get(k.lower())
+        if direct:
+            return direct
+        # 兼容「边界值测试」「异常场景」这类带修饰的写法
+        for syn, cat in _CAT_SYNONYMS.items():
+            if syn and syn in k:
+                return cat
+        return None
+
+    for key in ('category', 'type', 'tp_type'):
+        got = _try(tp.get(key))
+        if got:
+            return got
+
+    # 标题/描述关键词兜底（顺序即优先级：越"专"越先判）
+    blob = ' '.join(str(tp.get(k) or '') for k in ('title', 'description'))
+    # 否定式先剔除：「布局无异常」「不出现报错」这类不是在测异常
+    NEG = ('无异常', '没有异常', '无报错', '不报错', '无错误', '不出现错误',
+           '无崩溃', '不崩溃', '无失败', '不失败')
+    for n in NEG:
+        blob = blob.replace(n, '')
+    RULES = [
+        ('permission', ('权限', '登录态', '会员', '非会员', 'VIP', '越权', '角色', '未登录', '付费')),
+        ('exception', ('异常', '断网', '弱网', '超时', '失败', '重试', '中断', '崩溃',
+                       '错误', '无法', '异常处理', '超时重试', '杀进程')),
+        ('boundary', ('边界', '上限', '下限', '最大值', '最小值', '超长', '空值', '为空',
+                      '特殊字符', '字符数', '取值范围', '数量上限', '范围')),
+        ('performance', ('性能', '大数据量', '加载速度', '耗时', '内存', '滚动性能', '并发')),
+        ('UI', ('UI', '样式', '布局', '文案', '图标', '动画', '适配', '屏', '视觉', '展示正常', '截断')),
+    ]
+    for cat, words in RULES:
+        if any(w in blob for w in words):
+            return cat
+
+    return 'main_flow' if str(tp.get('priority', '')).upper() == 'P0' else 'branch_flow'
+
+
+def ensure_pass_criteria(test_points) -> dict:
+    """兜底补齐空 pass_criteria，避免「假覆盖」测试点落库（原地修改）。
+
+    背景：P7 输出可能解析失败（实测有 YAML 引号未闭合导致整份 JSON 丢弃），
+    此时 workflow 会 `final_tps = deduped` 降级使用合并前的输入；而 P5 风险扩展点
+    历史上不带 pass_criteria，降级路径就把空判据原样写库了 —— 这类测试点在
+    Bug 存在时同样会通过（假覆盖）。
+
+    策略（不编造业务断言，只做可信推导）：
+      1. 已有非空 pass_criteria → 保留
+      2. 否则若 description 里含可观测片段（「展示/提示/跳转/返回/变为/出现」等），
+         取包含这些词的句子作为判据
+      3. 都没有 → 标记 `_criteria_missing=True`，并写一句明确的缺口说明，
+         **不伪造**「页面正常」这类看似可判伪的句子，交由人工补
+    """
+    audit = {'total': 0, 'filled_from_desc': 0, 'still_missing': []}
+    if not isinstance(test_points, list):
+        return audit
+
+    OBSERVABLE = ('展示', '显示', '提示', '跳转', '进入', '返回', '出现', '消失',
+                  '变为', '变为0', 'Toast', 'toast', '文案', '数值', '字段',
+                  '报错', '错误码', '状态码', '刷新', '置灰', '不可点击')
+    PLACEHOLDER = ('见描述', '同上', '略', 'TBD', '无', '-', '—')
+
+    for t in test_points:
+        if not isinstance(t, dict):
+            continue
+        audit['total'] += 1
+        pc = str(t.get('pass_criteria') or '').strip()
+        if pc and pc not in PLACEHOLDER:
+            continue
+
+        desc = str(t.get('description') or '').strip()
+        picked = ''
+        if desc:
+            # 按中英文句号/分号切句，取第一句含可观测词的
+            for seg in re.split(r'(?<=[。；;.!?！？\n])', desc):
+                seg = seg.strip().rstrip('。；;')
+                if seg and any(k in seg for k in OBSERVABLE):
+                    picked = seg
+                    break
+        if picked:
+            t['pass_criteria'] = picked
+            t['_criteria_filled_from'] = 'description'
+            audit['filled_from_desc'] += 1
+        else:
+            # 不伪造判据：明确标出缺口，供前端/人工补
+            t['pass_criteria'] = (
+                '【判据缺失·待人工补充】本测试点未产出可观测判据，'
+                '在缺陷存在时可能无法判伪，需补充具体页面/元素/数值/接口断言。'
+            )
+            t['_criteria_missing'] = True
+            audit['still_missing'].append({
+                'id': t.get('id'), 'title': (t.get('title') or '')[:60]})
+    return audit
+
+
+def enforce_p0_ratio(test_points, limit=P0_RATIO_LIMIT, min_keep=P0_MIN_KEEP) -> dict:
+    """把 P0 占比压到 limit 以内（原地修改，返回审计信息）。
+
+    保护顺序（越靠前越优先保留为 P0）：
+      1. category == main_flow（核心主流程）
+      2. status == active / blocked 无关；source 含 risk 或 pci 的视为风险驱动，稍后降级
+      3. 其余按原顺序
+    只下调 P0 -> P1，不动 P1/P2，也不改 description/pass_criteria。
+    """
+    audit = {'before': 0, 'after': 0, 'limit': limit, 'demoted': []}
+    if not isinstance(test_points, list) or not test_points:
+        return audit
+
+    tps = [t for t in test_points if isinstance(t, dict)]
+    total = len(tps)
+    if total == 0:
+        return audit
+
+    p0_idx = [i for i, t in enumerate(tps)
+              if str(t.get('priority') or '').strip().upper() == 'P0']
+    audit['before'] = len(p0_idx)
+
+    # 配额优先：先按比例算，向下取整（保证不超上限）；
+    # min_keep 只在"按比例会压到 0 条"的极小批量下兜底，
+    # 否则 14 条 × 15% = 2.1 → 取 2 条，不应被 min_keep=3 抬到 3 条而破坏 15% 上限。
+    quota = int(total * limit)
+    if quota <= 0:
+        allowed = min(min_keep, len(p0_idx))
+    else:
+        allowed = min(quota, len(p0_idx))
+    if len(p0_idx) <= allowed:
+        audit['after'] = len(p0_idx)
+        return audit
+
+    # 排序：main_flow 优先保留；其次非 risk/pci 来源（基础功能点）优先；
+    # 最后按原顺序（保持稳定）
+    def _keep_score(i):
+        t = tps[i]
+        cat = str(t.get('category') or '').strip().lower()
+        src = [str(s).lower() for s in (t.get('source') or [])]
+        return (0 if cat == 'main_flow' else 1,
+                1 if ('risk' in src or 'pci' in src) else 0,
+                i)
+
+    keep = set(sorted(p0_idx, key=_keep_score)[:allowed])
+    for i in p0_idx:
+        if i in keep:
+            continue
+        t = tps[i]
+        t['priority'] = 'P1'
+        t['_priority_demoted'] = True
+        t['_priority_demote_reason'] = (
+            'P0 配额收敛：P0 占比超过 %.0f%%（原 %d/%d → 保留 %d 条）'
+            % (limit * 100, len(p0_idx), total, allowed)
+        )
+        audit['demoted'].append({
+            'id': t.get('id'), 'title': (t.get('title') or '')[:60],
+            'category': t.get('category'),
+        })
+
+    audit['after'] = len(keep)
+    return audit
 
 
 def _module_signature(module):
     parts = [
-        module.get('name', ''),
-        module.get('description', ''),
-        *[str(x) for x in module.get('key_features', []) if x],
+        str(module.get('name', '') or ''),
+        str(module.get('description', '') or ''),
+        *[_feature_text(x) for x in module.get('key_features', []) if x],
     ]
     text = _normalize_evidence_text(''.join(parts))
     for word in ('模块', '功能', '新增', '修改', '优化', '修订', '补充', '逻辑', '页面'):
@@ -328,7 +807,8 @@ def _merge_module_pair(primary, duplicate):
         primary.get('source_locations'), duplicate.get('source_locations')
     )
     merged['key_features'] = _ordered_union(
-        primary.get('key_features'), duplicate.get('key_features')
+        primary.get('key_features'), duplicate.get('key_features'),
+        key=_feature_dedup_key,
     )
 
     merged['source_evidence'] = _ordered_union(
@@ -2843,7 +3323,13 @@ class ModaoWorkflow:
                         f'模块信息：\n{mod_ctx}\n'
                         f'要求：每个测试点必须是 dict（含 title/type/priority/description/category），数量 5-20 条，'
                         f'基于模块的具体功能，不要泛化。\n'
-                        f'输出格式（直接输出 YAML）：\nmodule: {mod_name}\ntest_points:\n  - id: TP_{mod_name}_001\n    title: ...\n    type: 功能\n    category: main_flow\n    priority: P0\n    description: ...'
+                        f'输出格式（直接输出 YAML）：\nmodule: {mod_name}\ntest_points:\n'
+                        f'  - id: TP_{mod_name}_001\n    title: ...\n    type: <功能/边界/异常/UI/权限/性能/兼容>\n'
+                        f'    category: <main_flow/branch_flow/boundary/exception/permission/UI/performance>\n'
+                        f'    priority: P0\n    description: ...\n'
+                        f'category 必须按场景选：正常路径=main_flow，分支/可选路径=branch_flow，'
+                        f'空/超长/上下限=boundary，断网/超时/失败=exception，'
+                        f'登录态/权益=permission，文案/布局/动画=UI。不要全部写 branch_flow。'
                     ) + page_text_hint
                     try:
                         tp_out2 = self._llm(self.analyzer_config, retry_prompt, max_tokens=6000, temperature=0)
@@ -2858,12 +3344,7 @@ class ModaoWorkflow:
                     # 后处理：LLM 经常漏 category 字段，按 type/priority 推断补全
                     cat = (t.get('category') or '').strip()
                     if not cat:
-                        tp_type = t.get('type', '')
-                        cat_map = {'功能': 'main_flow', '边界': 'boundary',
-                                   '异常': 'exception', 'UI': 'UI', '权限': 'permission',
-                                   '性能': 'performance', '兼容': 'compatibility'}
-                        default = 'main_flow' if str(t.get('priority', '')).upper() == 'P0' else 'branch_flow'
-                        t['category'] = cat_map.get(tp_type, default)
+                        t['category'] = _infer_category(t)
 
                 # 3.3.5 风险识别 (risk)
                 risk_prompt = render_prompt(P5_RISK_IDENTIFY,
@@ -2885,6 +3366,10 @@ class ModaoWorkflow:
                             'description': etp.get('description', ''),
                             'priority': etp.get('priority_hint', 'P1'),
                             'category': ecat,
+                            # 透传功能级判据：此前这里没取 pass_criteria，导致风险扩展点
+                            # 全部以空判据进入 P7；P7 解析失败降级时更是原样落库，
+                            # 产生大量「假覆盖」测试点（历史实测 29% 为空）。
+                            'pass_criteria': etp.get('pass_criteria') or '',
                             'source': ['risk'],
                         })
 
@@ -2975,22 +3460,32 @@ class ModaoWorkflow:
                 if not merge_json:
                     merge_json = _parse_yaml(_extract_block(merge_out, 'yaml')) or {}
                 final_tps = merge_json.get('test_points', []) if isinstance(merge_json, dict) else []
-                # 安全网：若 P7 未按约定返回测试点，但去重后输入非空，则降级使用输入
+                # 安全网：若 P7 未按约定返回测试点，但去重后输入非空，则降级使用输入。
+                # ⚠️ 降级路径会跳过 P7 的合并/去重/补齐，必须把原因写进日志与审计，
+                # 否则「P7 输出解析失败」会静默变成「用例质量下降」，排查时无从下手
+                # （实测：模型输出了未闭合的引号，整份 JSON 被丢弃，降级后 7 条空判据原样落库）。
                 if not final_tps and deduped:
-                    logger.warning(f'模块[{mod_name}] P7 返回空测试点，降级使用去重后输入({len(deduped)}条)')
-                    self._log(f'  模块[{mod_name}] P7 返回空，降级使用去重后输入 {len(deduped)} 条')
+                    parse_failed = not merge_json
+                    logger.warning(
+                        f'模块[{mod_name}] P7 返回空测试点'
+                        f'（{"输出解析失败" if parse_failed else "模型未给出 test_points"}），'
+                        f'降级使用去重后输入({len(deduped)}条)')
+                    self._log(
+                        f'  模块[{mod_name}] P7 {"输出解析失败" if parse_failed else "未返回测试点"}，'
+                        f'降级使用去重后输入 {len(deduped)} 条（本次跳过合并/补齐）')
+                    dedup_audit.append({
+                        'stage': 'p7_fallback', 'module': mod_name,
+                        'reason': 'parse_failed' if parse_failed else 'empty_testpoints',
+                        'input_count': len(deduped),
+                        'raw_len': len(merge_out or ''),
+                        'raw_head': (merge_out or '')[:200],
+                    })
                     final_tps = deduped
                 for t in final_tps:
                     t['module'] = mod_name
                     # P7 合并后也补全 category（PCI 扩展点经常漏填）
-                    cat = (t.get('category') or '').strip()
-                    if not cat:
-                        tp_type = t.get('type', '')
-                        cat_map = {'功能': 'main_flow', '边界': 'boundary',
-                                   '异常': 'exception', 'UI': 'UI', '权限': 'permission',
-                                   '性能': 'performance', '兼容': 'compatibility'}
-                        default = 'main_flow' if str(t.get('priority', '')).upper() == 'P0' else 'branch_flow'
-                        t['category'] = cat_map.get(tp_type, default)
+                    if not (t.get('category') or '').strip():
+                        t['category'] = _infer_category(t)
                 all_final_tps.extend(final_tps)
                 logger.info(f'模块[{mod_name}] 三路合并：输入{len(combined)} 去重{dedup_count} 最终{len(final_tps)}')
                 self._log(f'  模块[{mod_name}] 合并完成：{len(final_tps)} 测试点')
@@ -3151,6 +3646,34 @@ class ModaoWorkflow:
         # 第一段产物落库（测试点合并完成，等待人工确认）
         if page is not None:
             # 单画布模式：把该画布的测试点写入 page.page_testpoints_json
+            # 回填 feature_ref / api_ref（P7 合并会丢这两列，只能事后用代码建立关联）
+            try:
+                _sum_for_ref = _parse_yaml(_extract_block(page.page_summary or '', 'yaml')) or {}
+                _n = backfill_testpoint_refs(all_final_tps, _sum_for_ref, page.page_name)
+                self._log(f'  追溯回填：{_n}/{len(all_final_tps)} 条测试点已关联功能点/接口')
+            except Exception as _e:
+                logger.warning(f'feature_ref 回填失败（不影响主流程）: {_e}')
+            # pass_criteria 兜底补齐（先补判据，再收敛优先级）
+            try:
+                _pc = ensure_pass_criteria(all_final_tps)
+                if _pc['filled_from_desc'] or _pc['still_missing']:
+                    self._log('  判据兜底：从描述补齐 %d 条，仍缺失 %d 条'
+                              % (_pc['filled_from_desc'], len(_pc['still_missing'])))
+                    dedup_audit.append({'stage': 'pass_criteria', 'page': page.page_name,
+                                        'filled_from_desc': _pc['filled_from_desc'],
+                                        'still_missing': _pc['still_missing']})
+            except Exception as _e:
+                logger.warning(f'pass_criteria 兜底失败（不影响主流程）: {_e}')
+            # P0 占比收敛（画布级：按本画布全部测试点计算配额）
+            try:
+                _pa = enforce_p0_ratio(all_final_tps)
+                if _pa['demoted']:
+                    self._log(
+                        '  P0 配额收敛：%d → %d 条（上限 %.0f%%），降级 %d 条'
+                        % (_pa['before'], _pa['after'], _pa['limit'] * 100, len(_pa['demoted'])))
+                    dedup_audit.append({'stage': 'p0_ratio', 'page': page.page_name, **_pa})
+            except Exception as _e:
+                logger.warning(f'P0 配额收敛失败（不影响主流程）: {_e}')
             page.page_testpoints_json = json.dumps(all_final_tps, ensure_ascii=False)
             page.mark_stage(3, status='done', log=f'测试点合并完成（{len(all_final_tps)} 条）')
             page.save(update_fields=['page_testpoints_json', 'current_stage', 'stage_status', 'work_log'])
@@ -3161,6 +3684,35 @@ class ModaoWorkflow:
                 'page_name': page.page_name,
                 'phase': 1,
             }
+        # 全局模式同样回填追溯字段（用合并后的 requirement_summary）
+        try:
+            _sum_for_ref = _parse_yaml(
+                _extract_block(self.prototype.requirement_summary or '', 'yaml')) or {}
+            _n = backfill_testpoint_refs(all_final_tps, _sum_for_ref)
+            self._log(f'  追溯回填：{_n}/{len(all_final_tps)} 条测试点已关联功能点/接口')
+        except Exception as _e:
+            logger.warning(f'feature_ref 回填失败（不影响主流程）: {_e}')
+        # pass_criteria 兜底补齐（任务级）
+        try:
+            _pc = ensure_pass_criteria(all_final_tps)
+            if _pc['filled_from_desc'] or _pc['still_missing']:
+                self._log('  判据兜底：从描述补齐 %d 条，仍缺失 %d 条'
+                          % (_pc['filled_from_desc'], len(_pc['still_missing'])))
+                dedup_audit.append({'stage': 'pass_criteria', 'scope': 'prototype',
+                                    'filled_from_desc': _pc['filled_from_desc'],
+                                    'still_missing': _pc['still_missing']})
+        except Exception as _e:
+            logger.warning(f'pass_criteria 兜底失败（不影响主流程）: {_e}')
+        # P0 占比收敛（任务级：按全部模块合计计算配额）
+        try:
+            _pa = enforce_p0_ratio(all_final_tps)
+            if _pa['demoted']:
+                self._log(
+                    '  P0 配额收敛：%d → %d 条（上限 %.0f%%），降级 %d 条'
+                    % (_pa['before'], _pa['after'], _pa['limit'] * 100, len(_pa['demoted'])))
+                dedup_audit.append({'stage': 'p0_ratio', 'scope': 'prototype', **_pa})
+        except Exception as _e:
+            logger.warning(f'P0 配额收敛失败（不影响主流程）: {_e}')
         self.prototype.risks_json = json.dumps(all_risks, ensure_ascii=False)
         self.prototype.pci_json = json.dumps(all_pci, ensure_ascii=False)
         self.prototype.final_testpoints_json = json.dumps(all_final_tps, ensure_ascii=False)

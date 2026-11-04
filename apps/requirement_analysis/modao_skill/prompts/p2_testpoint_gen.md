@@ -49,6 +49,17 @@
 13. **数量合理收敛与作用域守卫**：
     - **数量上限**：单张标准画布/模块的测试点总数应严格收敛在 12 ~ 20 条（极其复杂的综合画布不超过 25 条），杜绝为了凑数堆砌近义场景；
     - **严禁跨画布脑补（Scope Guard）**：测试点必须仅围绕当前画布所包含的视觉控件与交互逻辑设计，严禁引入其它画布特有的专属业务（如当前在文案输入页，严禁编造其它画布的“同频分析昨日74分”、“老版本历史记录迁移”等无关场景）。
+14. **功能点回指（feature_ref，必填）**：每条测试点必须填写 `feature_ref`，值为输入模块 `key_features` 中的 `id`（如 `["F-001"]`，跨多个功能点填多个）。
+    - 若某条测试点确实不对应任何具体功能点（如纯模块级入口可达性、跨功能联动），填 `["*"]` 并在 `description` 中说明归属。
+    - **每个 `key_features` 的 id 至少被一条测试点的 `feature_ref` 引用**（同一 id 可被多条引用）；输入模块中存在未被任何测试点引用的 id ⇒ 说明该功能点漏测，必须补测试点后再输出。
+    - 输入若为老数据（`key_features` 是裸字符串、无 id），`feature_ref` 填 `[]`，不因此报错，其余规则不变。
+15. **接口契约覆盖（api_ref，按需必填）**：
+    - 凡输入模块存在 `api_contracts`，且该 `api_contract` 的 `feature_ids` 与某条测试点的 `feature_ref` 有交集，则该组功能**至少要有 1 条测试点填写 `api_ref`**，值为对应的 `API-xxx` id。
+    - 涉及接口的测试点，其 `pass_criteria` **必须至少含 1 条接口级判据**（字段值变化 / 状态码 / 错误码 / 枚举取值），不得只写界面表现。
+    - **枚举值必须测全**：`api_contracts` 中某字段的 `values` 列出 N 个取值，则对应的成功/失败分支必须被覆盖（可合并在同一测试点的 `pass_criteria` 中逐条列出，但不得静默遗漏）。
+    - **错误码必须有分支**：`error_codes` 中每个 code 至少对应一条异常类测试点，`pass_criteria` 写明该 code 对应的用户可见表现。
+    - 输入无 `api_contracts` 或该功能点 `involves_api: false` 时，`api_ref` 填 `[]`。
+    - ⚠️ **禁止为凑 `api_ref` 编造接口**：`api_ref` 只能填输入中真实存在的 `API-xxx`；接口缺失属于上游缺口，应在 `pass_criteria` 中以"接口契约待确认"标注，不得虚构方法路径。
 
 ## 📝 输出格式（YAML）
 6. **决策表逐行覆盖**：每个decision_table原始row至少被一个测试点引用
@@ -86,6 +97,8 @@ test_points:
     source_states: [<state names>]
     source_transitions: [<transition indexes>]
     source_elements: [<element ids>]
+    feature_ref: [<key_features 的 id，如 F-001>]        # 必填，见硬约束 14
+    api_ref: [<api_contracts 的 id，如 API-001>]          # 涉及接口时必填，见硬约束 15
 ```
 
 ## 🔍 冒烟候选判定规则
@@ -129,6 +142,10 @@ test_points:
 - ❌ 所有测试点都是 P0
 - ❌ 冒烟候选全是 true（应控制在 10-15%）
 - ❌ 测试点描述模糊（"测试一下 XX 功能"）
+- ❌ 存在未被任何测试点引用的 `key_features` id（= 功能点漏测）
+- ❌ 涉及接口的测试点只写界面表现、不含任何接口级判据
+- ❌ 把 `api_contracts` 中的枚举值只测一部分
+- ❌ 为满足 `api_ref` 而虚构接口 id 或方法路径
 
 ## 📥 输入
 
