@@ -415,6 +415,19 @@ def _adopted_entry_keys(proto):
 
     普通 = "pageId#index"；冒烟 = "smoke#pageId#index"。判据与采纳入库完全一致
     （同项目 + 同标题 + 同归一化功能模块），使前端刷新后仍能隐藏已采纳行，避免重复采纳。
+
+    ⚠️ 2026-11-05（生产事故：MySQL 连接被打满 → 全站 500）：
+    原实现**每条用例执行 2 次查询**（先查 FeatureModule、再查 TestCase.exists），
+    一个任务若有 19 画布 × 数百条用例，就是数千次独立查询；而前端每 3 秒轮询
+    `/modao/{id}/` 全量模式时都会触发本函数，连接瞬间堆积（实测 152/151、
+    `Sleep` 150 条但 `time>60` 仅 1 条 —— 典型的高频短命连接），
+    最终 `OperationalError (1040, 'Too many connections')` /
+    `(2013, 'Lost connection to MySQL server during query')`。
+
+    现在改为**两次批量查询 + 内存匹配**：
+      1) 一次取项目下所有 FeatureModule 的 {name: id}；
+      2) 一次取该项目所有 TestCase 的 {(title, feature_module_id)}。
+    查询次数从 O(用例数×2) 降到 O(2)，与用例规模无关。
     """
     keys = set()
     if not proto.project_id:
@@ -423,19 +436,50 @@ def _adopted_entry_keys(proto):
     pages = list(proto.pages.exclude(page_testcases_json='').exclude(page_testcases_json__isnull=True))
     pages.sort(key=lambda p: (p.page_no or 0))
 
+    # ── 批量预取（只读，无写副作用）──
+    # 模块名 → 模块 id
+    _mod_id_by_name = dict(
+        FeatureModule.objects.filter(project=project).values_list('name', 'id'))
+    # (用例标题, 模块 id) 集合：一次取全项目用例，避免逐条 exists()
+    _case_pairs = set()
+    if _mod_id_by_name:
+        for _t, _fid in TestCase.objects.filter(
+                project=project,
+                feature_modules__isnull=False).values_list('title', 'feature_modules__id'):
+            if _t and _fid:
+                _case_pairs.add((_t, _fid))
+
+    # ⚠️ 归一化结果必须缓存：_canonical_module_name 内部每次都调
+    # _collect_canonical_modules(proto, project) 查库，若对每条用例都调用，
+    # 就退化成 N 次查询（实测 574 条用例 → 1152 次 SQL、3.6 秒）。
+    # 原始模块名重复率很高，按原名缓存即可把查询降到 1 次。
+    _mname_cache = {}
+    _CANON_MISS = object()
+
+    def _canon(raw_name):
+        if raw_name in _mname_cache:
+            v = _mname_cache[raw_name]
+            return None if v is _CANON_MISS else v
+        try:
+            v = _canonical_module_name(raw_name, proto=proto, project=project)
+        except Exception:
+            v = raw_name
+        _mname_cache[raw_name] = v if v else _CANON_MISS
+        return v or None
+
     def _in_lib(c):
         tc_obj = c.get('testcase', c) if isinstance(c, dict) else c
         f = _tc_fields(tc_obj)
         if not f['title']:
             return False
-        mname = _canonical_module_name(_module_of(c), proto=proto, project=project)
+        mname = _canon(_module_of(c))
         # 只读判定：这里绝不能 get_or_create。DETAIL 等 GET 接口会调用本函数，
         # get_or_create 会因缺少 created_by 触发 IntegrityError(1048)，且给只读请求带来写副作用。
         # 模块尚不存在 ⇒ 该用例必然未挂到该模块下 ⇒ 直接判为未入库。
-        fm = FeatureModule.objects.filter(project=project, name=mname).first()
-        if not fm:
+        fm_id = _mod_id_by_name.get(mname) if mname else None
+        if not fm_id:
             return False
-        return TestCase.objects.filter(project=project, title=f['title'], feature_modules=fm).exists()
+        return (f['title'], fm_id) in _case_pairs
 
     def _smoke_list(s):
         v = _safe_json_list(s)

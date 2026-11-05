@@ -87,6 +87,34 @@ from .services import RequirementAnalysisService, DocumentProcessor
 logger = logging.getLogger(__name__)
 
 
+def _thread_with_conn_cleanup(target):
+    """把后台线程 target 包一层：进入时 + 结束时都关闭数据库连接。
+
+    ⚠️ 2026-11-05（生产事故）：本模块有多个 ``threading.Thread`` 后台任务
+    （用例生成 / 重新评审 / 用例审计 / 重新生成），它们**都不受 HTTP 请求
+    生命周期管理**，而 ``DATABASES`` 未配 ``CONN_MAX_AGE``（默认 0，只在请求
+    结束时关连接）—— 线程跑完连接一直挂在 MySQL 侧，累积到
+    ``max_connections``（151）后全站请求报
+    ``OperationalError (1040, 'Too many connections')``，
+    前端表现为「加载失败: Request failed with status code 500」，
+    并伴随 ``(2013, 'Lost connection to MySQL server during query')``。
+
+    用法：``threading.Thread(target=_thread_with_conn_cleanup(fn), daemon=True)``
+    与 ``apps/ui_automation/apk_workflow.py`` 的做法保持一致。
+    """
+    from django.db import close_old_connections
+
+    def wrapper(*args, **kwargs):
+        close_old_connections()   # 进入前清一次，避免复用失效连接
+        try:
+            return target(*args, **kwargs)
+        finally:
+            # 关键：线程退出前必须归还连接，否则连接泄漏直到打满上限
+            close_old_connections()
+
+    return wrapper
+
+
 def _merge_human_feedback(old_feedback: str, new_feedback: str) -> str:
     """
     合并旧的人工确认回复和新提取的不确定项。
@@ -1707,11 +1735,23 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
                                         # 定义同步保存函数
                                         def save_stream_buffer(content):
-                                            """同步保存流式内容到数据库"""
-                                            task.stream_buffer = content
-                                            task.stream_position = len(content)
-                                            task.last_stream_update = timezone.now()
-                                            task.save(update_fields=['stream_buffer', 'stream_position', 'last_stream_update'])
+                                            """同步保存流式内容到数据库。
+
+                                            ⚠️ 2026-11-05：该函数被 `sync_to_async` 在
+                                            **线程池的不同线程**中调用，而流式生成每 10 个
+                                            chunk 就会触发一次。线程池线程复用 + 未清理连接，
+                                            会让连接在 MySQL 侧快速堆积（实测短时间冲到 150+，
+                                            伴随 `(2013, 'Lost connection to MySQL server
+                                            during query')`）。这里保存完立即归还连接。
+                                            """
+                                            from django.db import close_old_connections
+                                            try:
+                                                task.stream_buffer = content
+                                                task.stream_position = len(content)
+                                                task.last_stream_update = timezone.now()
+                                                task.save(update_fields=['stream_buffer', 'stream_position', 'last_stream_update'])
+                                            finally:
+                                                close_old_connections()
 
                                         # 转换为异步函数
                                         async_save_stream_buffer = sync_to_async(save_stream_buffer)
@@ -2148,9 +2188,17 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                             finally:
                                 # 无论成功/失败/取消，都要摘掉取消事件，避免字典无限增长
                                 _unregister_generation_task(task.task_id)
-                        
+                                # ⚠️ 2026-11-05：线程结束必须关闭数据库连接。
+                                # Django 的 CONN_MAX_AGE=0 只在 HTTP 请求结束时关连接，
+                                # 后台线程不受请求生命周期管理，连接会一直挂在 MySQL，
+                                # 累积到 max_connections 后全站报
+                                # OperationalError (1040, 'Too many connections') / 500。
+                                from django.db import close_old_connections
+                                close_old_connections()
+
                         # 在新线程中执行任务
-                        thread = threading.Thread(target=execute_task)
+                        thread = threading.Thread(
+                            target=_thread_with_conn_cleanup(execute_task))
                         thread.daemon = True
                         thread.start()
                         
@@ -3105,7 +3153,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 except Exception as e:
                     result_holder['error'] = str(e)
 
-            thread = threading.Thread(target=_run_revise, daemon=True)
+            thread = threading.Thread(
+                target=_thread_with_conn_cleanup(_run_revise), daemon=True)
             thread.start()
             thread.join(timeout=180)
 
@@ -3731,7 +3780,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     except Exception as db_err:
                         logger.error(f"[RERUN] 保存失败状态出错: {db_err}")
             
-            thread = threading.Thread(target=execute_review)
+            thread = threading.Thread(
+                target=_thread_with_conn_cleanup(execute_review))
             thread.daemon = True
             thread.start()
             
@@ -3807,10 +3857,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     logger.error(f"[KB审计] 任务 {task_id} 审计失败: {audit_error}")
                     logger.error(tb.format_exc())
             
-            thread = threading.Thread(target=execute_audit)
+            thread = threading.Thread(
+                target=_thread_with_conn_cleanup(execute_audit))
             thread.daemon = True
             thread.start()
-            
+
             return Response({
                 'message': '知识库审计已启动',
                 'task_id': task.task_id
