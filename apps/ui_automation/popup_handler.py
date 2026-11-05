@@ -64,9 +64,17 @@ POPUP_BUTTON_PRIORITY = (
     # 权限类：一律允许（用户要求"默认允许"）
     'allow', '允许', '始终允许', '使用期间允许', '仅在使用中允许',
     '好', 'OK', '同意', '接受', '我知道了', '知道了', '确定',
+    # 系统 Android 权限框的按钮文案（"使用应用时"/"仅限这一次"）
+    '使用应用时', '仅限这一次', '仅在使用该应用时', '向应用授予此权限',
+    'while using the app', 'only this time', 'grant',
     # 广告/引导类：跳过或关闭
     '跳过', '跳过广告', '关闭广告', 'skip',
     'later', '以后再说', '稍后', '下次再说', '暂不', '取消', 'close', 'x', '×',
+    # 登录/升级引导类：**不登录**也能继续用，一律选"取消/关闭"这一侧。
+    # 2026-11-02 真机实测（万年历「登录万年历 / 记录查看两不误 / 立即登录 / 取消」）：
+    # 自动处理弹窗开着，但模型给出的是「立即登录」—— 它不属禁点按钮，于是照点登录。
+    # 登录会切到登录页/拉起第三方 SDK，后续步骤全部在错误的页面上跑。
+    '不登录', '暂不登录', '以后登录', '稍后登录', '暂不设置',
 )
 
 #: 绝不允许点击的按钮关键词（付费 / 订阅 / 危险），命中即放弃关闭该弹窗。
@@ -75,6 +83,10 @@ POPUP_FORBIDDEN_BUTTONS = (
     '支付', '付款', '购买', '开通', '订阅', '立即续费', '充值', '升级会员',
     '同意并支付', '免费试用后付费', 'buy', 'subscribe', 'purchase',
     '删除', '清空', '退出登录', '注销',
+    # 登录/注册类：自动化用例不该替用户建立账号或切换登录态。
+    # 2026-11-02 实测踩到「登录万年历」弹窗被点「立即登录」，后续步骤全跑在登录页上。
+    '登录', '立即登录', '注册', '立即注册', '一键登录', '手机号登录',
+    'login', 'sign in', 'sign up', 'register',
 )
 
 
@@ -88,7 +100,7 @@ POPUP_DETECT_PROMPT = (
     '\n'
     'A popup is one of:\n'
     '  - a permission request (notifications / location / camera / photos / '
-    'microphone / cellular data)\n'
+    'microphone / cellular data / storage)\n'
     '  - a user agreement, privacy policy or terms-of-service dialog\n'
     '  - an app update prompt or a rating / review prompt\n'
     '  - a splash ad or an interstitial ad\n'
@@ -102,14 +114,19 @@ POPUP_DETECT_PROMPT = (
     '\n'
     'Answer with EXACTLY one line, no explanation:\n'
     '  none              -> there is no popup\n'
-    '  <button text>     -> there IS a popup; give the text of the button that '
-    'dismisses it\n'
+    '  <button text>     -> there IS a popup; give the text printed INSIDE the '
+    'button that dismisses it\n'
     '\n'
-    'When choosing the button, prefer accepting or skipping, in this order:\n'
-    '  allow / 允许 / 始终允许 / 使用期间允许 / 好 / OK / 同意 / 接受 / 我知道了\n'
-    '  later / 以后再说 / 稍后 / 跳过 / 跳过广告 / 取消 / close / X\n'
-    '**Permission dialogs must ALWAYS be allowed** (never deny a permission).\n'
-    'Never choose a button that buys something or starts a subscription '
+    'Rules for choosing the button:\n'
+    '  1. Copy the button text EXACTLY as it appears on screen. Do not translate, '
+    'do not add explanations, do not number the options.\n'
+    '  2. **Permission dialogs must ALWAYS be allowed** (never deny a permission).\n'
+    '     On Android 12+ this is usually "使用应用时" / "仅限这一次" / "允许".\n'
+    '  3. For a login / sign-up / member guide, choose the button that SKIPS it '
+    '("取消" / "暂不" / "以后再说" / "跳过" / "关闭"). NEVER choose '
+    '"立即登录" / "登录" / "注册" — it must not log in.\n'
+    '  4. For ads or update prompts choose "跳过" / "关闭" / "X" / "以后再说".\n'
+    '  5. Never choose a button that buys something or starts a subscription '
     '(支付/开通/订阅/购买/续费).'
 )
 
@@ -134,6 +151,18 @@ class PopupAdapter:
     def tap(self, target: str) -> None:
         """点击由自然语言描述的目标。"""
         raise NotImplementedError
+
+    def tap_text(self, text: str):
+        """按**屏幕上的确切文字**点击，返回是否点中。
+
+        与 `tap()` 的区别很关键：`tap()` 是自然语言描述走视觉定位，要调模型、
+        要几十秒，且模型可能把「立即登录」当成"接受"；`tap_text()` 是拿
+        UI 层级里的真实节点文字做**精确比对**再点它的中心坐标，不调模型、
+        毫秒级，也不可能理解错语义。
+
+        默认返回 False（未实现），调用方会退回 `tap()`。
+        """
+        return False
 
     def log(self, msg: str) -> None:
         """记录日志。"""
@@ -228,10 +257,27 @@ def dismiss_popups(adapter: PopupAdapter, max_layers: int = POPUP_MAX_LAYERS) ->
             break
 
         try:
-            adapter.tap(button)
+            # ⭐ 先按屏幕真实文字精确点击（不调模型、秒级、语义不会跑偏）。
+            # 为什么这是首选（2026-11-02 真机实测）：走视觉 `tap()` 时模型把
+            # 「登录万年历」弹窗理解成"同意"→ 点「立即登录」；而且一次视觉点击
+            # 要几十秒，冷启动预检 + 每步重试叠加起来会把一条用例拖到十几分钟。
+            # 拿 dump 里的真实节点文字做精确比对，既有确定性又几乎零成本。
+            tapped = False
+            try_text = getattr(adapter, 'tap_text', None)
+            if callable(try_text):
+                tapped = bool(try_text(button))
+                if tapped:
+                    adapter.log('[弹窗] 已按文字精确点击「%s」' % button)
         except Exception as exc:  # noqa: BLE001
-            adapter.log('[弹窗] 点击「%s」失败: %s' % (button, exc))
-            break
+            adapter.log('[弹窗] 按文字点击「%s」失败: %s' % (button, exc))
+            tapped = False
+
+        if not tapped:
+            try:
+                adapter.tap(button)
+            except Exception as exc:  # noqa: BLE001
+                adapter.log('[弹窗] 点击「%s」失败: %s' % (button, exc))
+                break
 
         closed += 1
         adapter.log('[弹窗] 已关闭第 %d 个弹窗（点击「%s」）' % (closed, button))
