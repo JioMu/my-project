@@ -56,10 +56,7 @@ services:
     env_file:
       - .env.dev
     environment:
-      # dev 固定连本地 mysql 容器（不依赖 .env.dev，避免被共享开发库配置覆盖）
-      # 优先级高于 env_file：environment 会覆盖 .env.dev 中的同名键。
-      DB_HOST: mysql
-      DB_PORT: 3306
+      # DB_HOST / DB_PORT 由 .env.dev 提供（团队共用共享开发库 192.168.8.75:13306）
       REDIS_URL: redis://redis:6379/0
       # midscene v1.8.7 要求显式指定模型 family（其 Node 服务从环境变量读取，
       # 不会继承 Python 请求线程里设置的 os.environ）。dashscope 多模态模型 qwen3.7-plus 配 qwen3-vl 协议。

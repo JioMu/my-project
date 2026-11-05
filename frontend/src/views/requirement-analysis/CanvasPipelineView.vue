@@ -142,7 +142,11 @@ export default {
       return this.pages.filter(p => (p.folder || '').trim() === this.folderFilter)
     },
     isRunning() {
-      return this.proto && ['extracting', 'structuring', 'clarifying', 'designing'].includes(this.proto.status)
+      const protoBusy = Boolean(
+        this.proto && ['extracting', 'structuring', 'clarifying', 'designing'].includes(this.proto.status)
+      )
+      const pageBusy = Array.isArray(this.pages) && this.pages.some(p => p && p.stage_status === 'extracting')
+      return protoBusy || pageBusy
     },
   },
   mounted() {
@@ -194,7 +198,11 @@ export default {
         if (!this.activeCanvasId && this.pages.length) {
           this.activeCanvasId = this.pages[0].id
         }
-        if (this.isRunning) this.startPoll()
+        if (this.isRunning) {
+          this.startPoll()
+        } else {
+          this.stopPoll()
+        }
       } catch (e) {
         this.$message.error('加载失败：' + (e.response?.data?.detail || e.message))
       } finally {

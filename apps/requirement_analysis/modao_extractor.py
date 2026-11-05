@@ -338,7 +338,8 @@ class ModaoExtractor:
 
             page = await context.new_page()
             try:
-                await page.goto(url, wait_until='networkidle', timeout=60000)
+                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                await page.wait_for_timeout(1000)
             except Exception as e:
                 warnings.append(f'页面加载超时/异常（继续尝试提取）: {e}')
                 try:
@@ -1310,33 +1311,31 @@ class ModaoExtractor:
             return None
         norm = base_url.rstrip('/').lower() + '/'
         try:
-            qs = (ModaoPrototype.objects
-                  .exclude(extracted_json='')
-                  .order_by('-id')
-                  .values_list('extracted_json', flat=True)[:80])
+            qs = list(ModaoPrototype.objects
+                      .exclude(extracted_json='')
+                      .order_by('-id')
+                      .values_list('extracted_json', flat=True)[:80])
+            for ej in qs:
+                try:
+                    data = json.loads(ej or '{}')
+                except Exception:
+                    continue
+                # 候选来源：urls 列表 / pages 里记录过的文件级 URL / warnings 里的定位结果
+                cands = list(data.get('urls') or [])
+                for w in (data.get('warnings') or []):
+                    m = re.search(r'已从目录地址定位到单文件：(\S+)', str(w))
+                    if m:
+                        cands.append(m.group(1))
+                for c in cands:
+                    c = str(c or '').strip()
+                    if not c.lower().startswith(norm):
+                        continue
+                    if '.' not in c.rsplit('/', 1)[-1]:
+                        continue
+                    return c
         except Exception:
             return None
-        for ej in qs:
-            try:
-                data = json.loads(ej or '{}')
-            except Exception:
-                continue
-            # 候选来源：urls 列表 / pages 里记录过的文件级 URL / warnings 里的定位结果
-            cands = list(data.get('urls') or [])
-            for w in (data.get('warnings') or []):
-                m = re.search(r'已从目录地址定位到单文件：(\S+)', str(w))
-                if m:
-                    cands.append(m.group(1))
-            for c in cands:
-                c = str(c or '').strip()
-                if not c.lower().startswith(norm):
-                    continue
-                if '.' not in c.rsplit('/', 1)[-1]:
-                    continue  # 仍是目录，不要
-                logger.info(f'[目录解析] 从历史记录兜底命中直链：{c}')
-                return c
         return None
-
     # ---------- PRD 报告页（第 4 种来源，纯 HTTP）----------
     @staticmethod
     def _is_prd_report_html(html_text: str) -> bool:
@@ -1679,7 +1678,8 @@ class ModaoExtractor:
                     user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                                 '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'))
                 page = await context.new_page()
-                await page.goto(url, wait_until='networkidle', timeout=60000)
+                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                await page.wait_for_timeout(1000)
 
                 async def _read_screen():
                     return await page.evaluate('''() => {
@@ -1705,7 +1705,8 @@ class ModaoExtractor:
 
     async def _capture_singlefile_h5_session(self, url: str, pages_meta: List[Dict[str, Any]],
                                             cookie_dict: Optional[Dict[str, str]] = None,
-                                            prototype_id: Optional[int] = None) -> Tuple[Dict[str, str], Dict[int, Dict[str, Any]]]:
+                                            prototype_id: Optional[int] = None,
+                                            target_set: Optional[set] = None) -> Tuple[Dict[str, str], Dict[int, Dict[str, Any]]]:
         """单次 Playwright 会话快速连拍所有主页面与子状态全景截图，同时读取屏幕 innerText。
         避免对每个状态反复 launch 浏览器。保持全景视口截图，绝不裁切需求信息。
         """
@@ -1726,28 +1727,159 @@ class ModaoExtractor:
                     await context.add_cookies(cookies)
 
                 page = await context.new_page()
-                await page.goto(url, wait_until='networkidle', timeout=60000)
+                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                await page.wait_for_timeout(1000)
+
+                # 优先从浏览器运行时读取最终页面列表：
+                # 1) 优先提取左侧导航栏真实可见的目录项（所见即所得，自动过滤隐藏/存档/废弃节点，保证与肉眼所见100%一致）；
+                # 2) 兜底提取运行时 pages 数组（自动过滤 hidden/visible=false 及旧版存档组）；
+                # 避免静态正则只提取到首个 script 的旧页面 ID 导致 render(pid) 失败或被原型内部重定向到首屏。
+                try:
+                    rt_pages = await page.evaluate(r"""() => {
+                        const isVisible = (el) => {
+                            if (!el) return false;
+                            if (el.hidden) return false;
+                            const style = window.getComputedStyle(el);
+                            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                            return true;
+                        };
+                        // 1. 优先从左侧真实可见的导航栏提取（保证与肉眼所见100%一致，自动排除隐藏、存档节点）
+                        const navEl = document.getElementById('nav') || document.querySelector('.nav') || document.querySelector('.sidebar-nav') || document.querySelector('.directory');
+                        if (navEl && isVisible(navEl)) {
+                            const items = [];
+                            let curGroup = '';
+                            for (const child of navEl.children) {
+                                if (!isVisible(child)) continue;
+                                if (child.classList.contains('nav-group') || child.classList.contains('group-title')) {
+                                    curGroup = (child.innerText || '').trim();
+                                } else if (child.classList.contains('nav-item') || child.tagName === 'BUTTON' || child.tagName === 'A') {
+                                    const text = (child.innerText || '').trim().replace(/\n+/g, ' ');
+                                    const onclick = child.getAttribute('onclick') || '';
+                                    let pid = '';
+                                    const m = onclick.match(/(?:vDirectory|render|go|showPage|switchPage)\s*\(\s*['"]([^'"]+)['"]/);
+                                    if (m) {
+                                        pid = m[1];
+                                    } else if (child.dataset && (child.dataset.id || child.dataset.page)) {
+                                        pid = child.dataset.id || child.dataset.page;
+                                    }
+                                    if (pid) {
+                                        items.push({
+                                            id: pid,
+                                            group: curGroup,
+                                            title: text,
+                                            states: []
+                                        });
+                                    }
+                                }
+                            }
+                            if (items.length >= 2) {
+                                const pageMap = (typeof pages !== 'undefined' && Array.isArray(pages))
+                                    ? new Map(pages.map(p => [String(p.id).trim(), p]))
+                                    : new Map();
+                                return items.map(it => {
+                                    const orig = pageMap.get(it.id);
+                                    return {
+                                        id: it.id,
+                                        group: it.group || (orig && orig.group ? String(orig.group).trim() : ''),
+                                        title: it.title || (orig && orig.title ? String(orig.title).trim() : ''),
+                                        states: (orig && Array.isArray(orig.states))
+                                            ? orig.states.map(s => String(s).trim()).filter(Boolean)
+                                            : []
+                                    };
+                                });
+                            }
+                        }
+
+                        // 2. 兜底：从全局 pages / window.pages 读取，但必须过滤掉明确标记为隐藏/存档的页面
+                        const raw = (typeof pages !== 'undefined' && Array.isArray(pages))
+                            ? pages
+                            : (Array.isArray(window.pages) ? window.pages : null);
+                        if (!raw || !raw.length) return null;
+                        return raw.filter(p => {
+                            if (!p || p.id == null) return false;
+                            if (p.hidden === true || p.visible === false) return false;
+                            const g = String(p.group || '');
+                            if (g.includes('存档') || g.includes('废弃') || g.includes('旧版')) return false;
+                            return true;
+                        }).map(p => ({
+                            id: (p && p.id != null) ? String(p.id).trim() : '',
+                            group: (p && p.group != null) ? String(p.group).trim() : '',
+                            title: (p && p.title != null) ? String(p.title).trim() : '',
+                            states: (p && Array.isArray(p.states))
+                                ? p.states.map(s => String(s).trim()).filter(Boolean)
+                                : []
+                        })).filter(p => p.id);
+                    }""")
+                    if isinstance(rt_pages, list) and rt_pages:
+                        if target_set:
+                            named = []
+                            for _m in rt_pages:
+                                _t = _m.get('title') or ''
+                                _g = _m.get('group') or ''
+                                _pn = f'{_g}-{_t}' if _g else _t
+                                if _pn in target_set:
+                                    named.append(_m)
+                            if not named:
+                                for _m in rt_pages:
+                                    _t = (_m.get('title') or '').strip()
+                                    if any(_t and _t in _tn for _tn in target_set) or any(_tn and _tn in _t for _tn in target_set):
+                                        named.append(_m)
+                            if named:
+                                rt_pages = named
+                        pages_meta[:] = rt_pages
+                except Exception as e:
+                    logger.warning(f"单文件H5 运行时 pages 提取失败，回退静态解析结果: {e}")
 
                 for idx, meta in enumerate(pages_meta, 1):
                     _raise_if_terminated(prototype_id)
                     pid = meta.get('id') or f'page{idx}'
                     states = meta.get('states') or []
-                    page_entry = {'default_shot': None, 'state_shots': []}
+                    page_entry = {'default_shot': None, 'state_shots': [], 'spec_text': ''}
 
-                    # 1. 切换并拍摄默认态全景
+                    # 1. 切换并拍摄默认态全景（兼容 vDirectory 导航跳转与 render 函数）
                     try:
-                        await page.evaluate(f"render('{pid}')")
-                        await page.wait_for_timeout(250)
+                        for js in (
+                            f"if (typeof vDirectory === 'function') vDirectory('{pid}'); else if (typeof render === 'function') render('{pid}')",
+                            f"render('{pid}')",
+                        ):
+                            try:
+                                await page.evaluate(js)
+                                break
+                            except Exception:
+                                continue
+                        await page.wait_for_timeout(300)
                     except Exception as e:
-                        logger.warning(f"页面[{pid}] render 失败: {e}")
+                        logger.warning(f"页面[{pid}] 切换渲染失败: {e}")
 
-                    # 读取屏幕文本
+                    # 读取屏幕文本及运行时渲染的需求说明正文（兼容动态脚本注入的 spec/templates）
                     try:
-                        stxt = await page.evaluate("""() => {
-                            const el = document.querySelector('.phone') || document.querySelector('.screen') || document.body;
-                            return el ? (el.innerText || el.textContent || '') : '';
-                        }""")
-                        screen_texts[pid] = (stxt or '').strip()
+                        dom_pair = await page.evaluate("""(pid) => {
+                            const phoneEl = document.querySelector('.phone') || document.querySelector('.screen');
+                            const phoneTxt = phoneEl
+                                ? (phoneEl.innerText || phoneEl.textContent || '')
+                                : (document.body ? (document.body.innerText || '') : '');
+                            let specTxt = '';
+                            const specEl = document.querySelector('#notes, .notes, #specBody, #specContent, #spec, .spec-body, .spec-content, .spec');
+                            if (specEl && specEl !== phoneEl && (!phoneEl || !phoneEl.contains(specEl))) {
+                                specTxt = specEl.innerText || specEl.textContent || '';
+                            } else {
+                                const rawSpec = (typeof specEdits !== 'undefined' && specEdits && specEdits[pid])
+                                    || (typeof defaultSpecs !== 'undefined' && defaultSpecs && defaultSpecs[pid])
+                                    || (typeof templates !== 'undefined' && templates && templates[pid])
+                                    || '';
+                                if (typeof rawSpec === 'string' && rawSpec) {
+                                    const tmp = document.createElement('div');
+                                    tmp.innerHTML = rawSpec;
+                                    specTxt = tmp.innerText || tmp.textContent || '';
+                                }
+                            }
+                            return {
+                                phone: (phoneTxt || '').trim(),
+                                spec: (specTxt || '').trim()
+                            };
+                        }""", pid)
+                        screen_texts[pid] = (dom_pair.get('phone') or '').strip()
+                        page_entry['spec_text'] = (dom_pair.get('spec') or '').strip()
                     except Exception:
                         screen_texts[pid] = ''
 
@@ -1996,8 +2128,17 @@ class ModaoExtractor:
         shot_manifest: Dict[int, Dict[str, Any]] = {}
         try:
             screen_texts, shot_manifest = asyncio.run(
-                self._capture_singlefile_h5_session(url, pages_meta, cookie_dict=cookie_dict, prototype_id=_proto_id)
+                self._capture_singlefile_h5_session(
+                    url, pages_meta, cookie_dict=cookie_dict,
+                    prototype_id=_proto_id, target_set=_target_set
+                )
             )
+            # 补充运行时新增/修改的页面标题与分组到全局导航剔除集
+            for _m in pages_meta:
+                for _k in ('title', 'group'):
+                    _v = str(_m.get(_k) or '').strip()
+                    if _v:
+                        h5_global_lines.add(_v)
         except Exception as e:
             logger.warning(f'单文件H5 会话截图连拍失败，回退为空: {e}')
 
@@ -2023,8 +2164,11 @@ class ModaoExtractor:
                 page_name = f'{group}-{title}' if group else title
                 tpl_html = templates.get(pid, '')
                 dom_text = ''
-                if isinstance(tpl_html, str):
+                if isinstance(tpl_html, str) and tpl_html.strip():
                     dom_text = html.unescape(_TAG_RE.sub(' ', tpl_html)).strip()
+                rt_spec = ((shot_manifest.get(idx) or {}).get('spec_text') or '').strip()
+                if rt_spec:
+                    dom_text = rt_spec
                 stxt = (screen_texts.get(pid) or '').strip()
                 if stxt:
                     dom_text = (dom_text + '\n[手机界面] ' + stxt).strip()
@@ -2047,12 +2191,12 @@ class ModaoExtractor:
                     if st_item.get('artifacts'):
                         page_vision_artifacts.extend(st_item['artifacts'])
 
-                # 代表截图优先取状态截图或默认全景
+                # 代表截图优先取默认全景主图（保证画布主展示位为页面默认常态全貌，子状态截图用于增量视觉分析）
                 entry = shot_manifest.get(idx) or {}
-                st_shots = entry.get('state_shots', [])
-                shot_file = st_shots[-1]['shot_path'] if st_shots else entry.get('default_shot')
+                shot_file = entry.get('default_shot')
                 if not shot_file or not os.path.exists(shot_file):
-                    shot_file = entry.get('default_shot')
+                    st_shots = entry.get('state_shots', [])
+                    shot_file = st_shots[0]['shot_path'] if st_shots else None
                 screenshot_path = os.path.relpath(shot_file, self.media_root) if shot_file and os.path.exists(shot_file) else ''
 
                 vision_attempted = bool(vision_config)
@@ -4063,11 +4207,17 @@ class ModaoExtractor:
         if not dom_all and not vis_all:
             _dbg = '[FUSION] both dom/vis empty -> return []\n'
             print(_dbg, flush=True)
-            with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+            if getattr(self, 'shot_dir', None):
+                    try:
+                        with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+                    except Exception: pass
             return []
         _dbg = f'[FUSION] START dom_pages={len(dom_all)} vis_pages={len(vis_all)} dom_total={dom_total}\n'
         print(_dbg, flush=True)
-        with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+        if getattr(self, 'shot_dir', None):
+                    try:
+                        with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+                    except Exception: pass
         # 并行优化：DOM 抽取与视觉抽取两路输入完全独立，用 gather 同时发起，
         # 把两次串行 LLM 调用压缩为一次（耗时 ≈ max(dom, vis) 而非 sum），最后再融合。
         if dom_all and vis_all:
@@ -4084,7 +4234,10 @@ class ModaoExtractor:
         fused = await self._dual_fuse(AIModelService, fusion_config, dom_reqs, vis_reqs, dom_total)
         _dbg = f'[FUSION] END total_fused={len(fused)}\n'
         print(_dbg, flush=True)
-        with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+        if getattr(self, 'shot_dir', None):
+                    try:
+                        with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+                    except Exception: pass
         return fused
 
     async def _dual_extract_one(self, aim_service, fusion_config, blocks):
@@ -4118,7 +4271,10 @@ class ModaoExtractor:
                 _dbg = (f'[FUSION] extract_batch {batch_no}/{len(batches)} '
                         f'raw_len={len(content)} parsed={len(parsed)}\n')
                 print(_dbg, flush=True)
-                with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+                if getattr(self, 'shot_dir', None):
+                    try:
+                        with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+                    except Exception: pass
                 requirements.extend(parsed)
             except Exception as e:
                 raise RuntimeError(f'双路抽取第 {batch_no}/{len(batches)} 批失败: {e}') from e
@@ -4145,7 +4301,10 @@ class ModaoExtractor:
             _dbg = (f'[FUSION] fuse_reqs dom={len(dom_reqs)} vis={len(vis_reqs)} '
                     f'raw_len={len(content)} parsed={len(parsed)}\n')
             print(_dbg, flush=True)
-            with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+            if getattr(self, 'shot_dir', None):
+                    try:
+                        with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+                    except Exception: pass
             if parsed:
                 return parsed
             # 融合输出无法解析（多为输出被 max_tokens 截断）：降级为两路并集，

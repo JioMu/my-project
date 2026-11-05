@@ -367,6 +367,13 @@ export default {
       const total = (this.filteredPages || []).length
       return selected > 0 && selected < total
     },
+    isRunning() {
+      const protoBusy = Boolean(
+        this.proto && ['extracting', 'structuring', 'clarifying', 'designing'].includes(this.proto.status)
+      )
+      const pageBusy = Array.isArray(this.pages) && this.pages.some(p => p && p.stage_status === 'extracting')
+      return protoBusy || pageBusy
+    },
   },
   watch: {
     // 切到「用例集合」tab 时才需要逐页用例产物（allCases/allSmoke 会遍历
@@ -463,16 +470,12 @@ export default {
         // ⚠️ 一旦拉过全量（_fullLoaded），之后的轮询也必须用全量：
         // 否则 3 秒后 openCanvas/用例集合 刚拿到的 page_testcases_json 等
         // 会被轻量响应覆盖掉，抽屉内容"闪一下又空了"。
-        const params = this._fullLoaded ? {} : { light: 1 }
+        const needFull = this._fullLoaded || this.drawerVisible || this.activeTab === 'cases'
+        const params = needFull ? {} : { light: 1 }
         const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get', params })
         this.proto = res.data
-        if (this._fullLoaded) {
-          // 保持抽屉聚焦对象同步到新的页面对象（loadDetail 会替换 pages 数组）
-          const fid = this.focused && this.focused.id
-          if (fid) {
-            const found = (this.pages || []).find(x => x.id === fid)
-            if (found) this.focused = found
-          }
+        if (needFull) {
+          this._fullLoaded = true
         }
         const incoming = (res.data.pages || []).slice().sort((a, b) => (a.page_no || 0) - (b.page_no || 0))
         // 勾选状态以服务端为准（它已持久化），但用户刚点、还没写回完成的改动
@@ -484,7 +487,17 @@ export default {
           }
           return p
         })
-        if (this.isRunning) this.startPoll()
+        if (this.focused && this.focused.id) {
+          // 保持抽屉聚焦对象同步到更新后的新页面对象（loadDetail 会替换 pages 数组）
+          const fid = this.focused.id
+          const found = (this.pages || []).find(x => x.id === fid)
+          if (found) this.focused = found
+        }
+        if (this.isRunning) {
+          this.startPoll()
+        } else {
+          this.stopPoll()
+        }
       } catch (e) {
         this.$message.error('加载失败：' + (e.response?.data?.detail || e.message))
       } finally {
@@ -704,9 +717,6 @@ export default {
       } finally {
         this.busy = false
       }
-    },
-    get isRunning() {
-      return this.proto && ['extracting', 'structuring', 'clarifying', 'designing'].includes(this.proto.status)
     },
     startPoll() {
       this.stopPoll()
