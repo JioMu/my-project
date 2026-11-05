@@ -36,6 +36,19 @@ MANIFEST = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 </manifest>"""
 
 
+def _feature_text_of(item) -> str:
+    """取 key_features 条目的文本，兼容对象（新格式）与裸字符串（老格式）。"""
+    if isinstance(item, dict):
+        for key in ("text", "title", "name", "description"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+    if item is None:
+        return ""
+    return str(item).strip()
+
+
 def _node(title, note=None, children=None):
     """构造一个 XMind content.json 节点。"""
     n = {
@@ -83,10 +96,17 @@ def build_xmind_json(proto, summary_yaml):
             kf_children = []
             for f in kf:
                 if isinstance(f, dict):
-                    ft = (f.get("title") or f.get("name") or "").strip()
+                    # 新格式 key_features 用 text 字段；老格式可能是 title/name。
+                    ft = (f.get("text") or f.get("title") or f.get("name") or "").strip()
                     if not ft:
                         continue
                     note = (f.get("desc") or f.get("description") or "").strip()
+                    # 有稳定编号时把编号带进 XMind，便于导图与测试点互相回指。
+                    fid = (f.get("id") or "").strip() if isinstance(f.get("id"), str) else ""
+                    if fid:
+                        ft = f"{fid} {ft}"
+                    if not note and (f.get("involves_api") is True):
+                        note = "涉及接口"
                     kf_children.append(_node(ft, note=note))
                 elif isinstance(f, str) and f.strip():
                     kf_children.append(_node(f.strip()))
@@ -187,8 +207,18 @@ def parse_xmind_bytes(data):
                 mod["priority_source"] = ctitle[len(PRIORITY_SRC_PREFIX):].strip()
             elif ctitle == KEY_FEATURES_LABEL:
                 for kf in (c.get("children") or {}).get("attached") or []:
-                    if isinstance(kf, dict) and (kf.get("title") or "").strip():
-                        mod["key_features"].append(kf["title"].strip())
+                    if not isinstance(kf, dict):
+                        continue
+                    ktitle = (kf.get("title") or "").strip()
+                    if not ktitle:
+                        continue
+                    # 导出时写过 "F-001 功能点文本"，回读时把编号拆回 id，
+                    # 并按新格式还原为对象，避免 XMind 往返把 key_features 降级成裸字符串。
+                    fid, _, body = ktitle.partition(" ")
+                    if fid and body and fid.startswith("F-") and fid[2:].isdigit():
+                        mod["key_features"].append({"id": fid, "text": body.strip()})
+                    else:
+                        mod["key_features"].append(ktitle)
             elif ctitle == SUB_PAGES_LABEL:
                 for sp in (c.get("children") or {}).get("attached") or []:
                     if isinstance(sp, dict) and (sp.get("title") or "").strip():
@@ -201,7 +231,30 @@ def parse_xmind_bytes(data):
 def modules_to_yaml(modules, root_title=""):
     """把解析出的 modules 还原为结构化 YAML 字符串（保留其余顶层字段由调用方合并）。"""
     import yaml
-    out = {"modules": modules}
+    out = {"modules": [_normalize_module_features(m) for m in (modules or [])]}
     if root_title:
         out["_title"] = root_title
     return yaml.safe_dump(out, allow_unicode=True, sort_keys=False, width=120)
+
+
+def _normalize_module_features(module):
+    """把 key_features 的裸字符串项升级为新格式对象，保证下游能拿到 id/text。"""
+    if not isinstance(module, dict):
+        return module
+    feats = module.get("key_features")
+    if not isinstance(feats, list):
+        return module
+    upgraded = []
+    for idx, item in enumerate(feats, 1):
+        if isinstance(item, dict):
+            upgraded.append(item)
+            continue
+        text = _feature_text_of(item)
+        if not text:
+            continue
+        upgraded.append({"id": "F-%03d" % idx, "text": text})
+    if upgraded == feats:
+        return module
+    out = dict(module)
+    out["key_features"] = upgraded
+    return out

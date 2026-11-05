@@ -2740,8 +2740,16 @@ export default {
           if (kfs.length) {
             const kfChildren = kfs.map((f) => {
               if (typeof f === 'string') return { label: f }
-              const t = f.title || f.name || ''
-              return { label: t + (f.desc || f.description ? `（${f.desc || f.description}）` : '') }
+              // 新格式用 text 字段 + F-xxx 稳定编号；老格式是 title/name。
+              // 不读 text 会让新版功能点在导出的思维导图里整体消失。
+              const body = f.text || f.title || f.name || ''
+              if (!body) return { label: '' }
+              const id = typeof f.id === 'string' ? f.id : ''
+              const note = f.desc || f.description
+              return {
+                label: (id ? `${id} ` : '') + body +
+                  (note ? `（${note}）` : (f.involves_api === true ? '（涉及接口）' : ''))
+              }
             }).filter((n) => n.label)
             if (kfChildren.length) mNode.children.push({ label: '🔑 关键特征', children: kfChildren })
           }

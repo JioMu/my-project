@@ -70,6 +70,49 @@ def _apply_rpc_timeout():
     except Exception as exc:  # noqa: BLE001
         logger.warning('[Midscene] 设置 RPC 超时失败: %s', exc)
 
+
+def _infer_model_family(model_name):
+    """按模型名推断 midscene 的 MIDSCENE_MODEL_FAMILY（两条配置路径共用）。
+
+    为什么必须有（2026-11-02 生产事故）：
+      「AI 用例管理」走 legacy 路径读 `AIModelConfig`，而**该表根本没有
+      model_family 字段**。旧代码 `getattr(cfg, 'model_family', '') or ''`
+      永远拿到空串 ⇒ connect() 不设置环境变量 ⇒ midscene 回退默认值 `openai`
+      ⇒ 每次模型调用都抛：
+        Invalid MIDSCENE_MODEL_FAMILY value: openai.
+        Current version v1.8.7 accepts: doubao-vision, doubao-seed, gemini,
+        qwen2.5-vl, qwen3-vl, qwen3.5, qwen3.6, vlm-ui-tars, ..., gpt-5
+      表现是整条用例的每个步骤连续失败，且错误一模一样。
+
+    取舍：宁可给纯文本模型也猜一个多模态 family（最多浪费一次调用），
+    也不要返回空 —— 空会让整个链路直接崩。
+
+    Returns:
+        str 合法 family；无法判断时返回空串（调用方按需处理）
+    """
+    mn = str(model_name or '').strip().lower()
+    if not mn:
+        return ''
+    if 'qwen' in mn:
+        # qwen3.x-plus / qwen3-vl / qwen2.5-vl / qwen-vl / *-omni-*
+        # 注意：qwen3.x 系列（含 qwen3.7-plus）实测走 qwen3-vl 口径可用
+        if 'qwen2' in mn:
+            return 'qwen2.5-vl'
+        return 'qwen3-vl'
+    if 'glm' in mn:
+        return 'glm-v'
+    if 'gemini' in mn:
+        return 'gemini'
+    if 'doubao' in mn or 'seed' in mn:
+        return 'doubao-vision'
+    if 'ui-tars' in mn:
+        return 'vlm-ui-tars'
+    if mn.startswith('gpt') or 'gpt-' in mn or 'gpt5' in mn:
+        return 'gpt-5'
+    return ''
+
+
+
 # 坐标/像素写法护栏：用例必须用语义描述，禁止写死坐标，否则换机型必错位
 # 命中规则（兼顾 midscene bbox=[x,y,x,y] 与单点 [x,y]，但尽量不误伤业务数字）：
 #   1) 四个数字（bbox）：\d,\d,\d,\d
@@ -354,7 +397,16 @@ class MidsceneAppEngine:
             'api_key': cfg.api_key,
             'base_url': cfg.base_url,
             'model_name': cfg.model_name,
-            'model_family': getattr(cfg, 'model_family', '') or '',
+            # ⚠️ `AIModelConfig` **没有 model_family 字段**（2026-11-02 生产事故确认）。
+            # 原来写 `getattr(cfg, 'model_family', '') or ''` 永远得空串，于是
+            # connect() 不设置 MIDSCENE_MODEL_FAMILY，midscene 回退默认值 `openai`，
+            # 每次调用都抛：
+            #   Invalid MIDSCENE_MODEL_FAMILY value: openai.
+            #   Current version v1.8.7 accepts: doubao-vision, ..., qwen2.5-vl,
+            #   qwen3-vl, ..., gpt-5
+            # 表现是「AI 用例管理」里所有步骤连续失败（每步都是这一条错误）。
+            # ⇒ 必须按模型名自己推断，与 AiModeModelConfig.resolved_family 同口径。
+            'model_family': _infer_model_family(cfg.model_name),
         }
 
     def _load_ai_mode_config(self) -> dict:
@@ -473,6 +525,18 @@ class MidsceneAppEngine:
             if family:
                 os.environ['MIDSCENE_MODEL_FAMILY'] = family
                 logger.info("[Midscene] 设置 MIDSCENE_MODEL_FAMILY=%s", family)
+            else:
+                # 推断不出 family 时**必须清掉**已有的环境变量。
+                # 环境是进程级的：只要之前某次设置过非法值（例如上游写入 openai），
+                # 后续所有连接都会继承它并稳定报
+                #   Invalid MIDSCENE_MODEL_FAMILY value: openai
+                # 清掉后 midscene 会按自己的默认逻辑处理，比留着一个非法值好。
+                stale = os.environ.pop('MIDSCENE_MODEL_FAMILY', None)
+                if stale:
+                    logger.warning(
+                        "[Midscene] 模型名「%s」推断不出 family，已清除残留的 "
+                        "MIDSCENE_MODEL_FAMILY=%s",
+                        cfg.get('model_name') or '(空)', stale)
             model_config = MidsceneConfig(
                 base_url=cfg.get('base_url') or '',
                 api_key=cfg['api_key'],
@@ -699,6 +763,29 @@ class MidsceneAppEngine:
         if not getattr(self, '_woke', False):
             self._woke = True
             self._wake_and_unlock()
+
+        # ⭐ 包未安装 ⇒ 立即失败，绝不重试（2026-11-02 真实事故）。
+        #
+        # 那次 prod 跑「com.ireadercity.zhwll」：手机上是万年历，这个包根本没装。
+        # 旧逻辑把它当成"启动慢"，重试 3 次、每次等 6 秒，
+        # 白白耗掉 4 分多钟，最后只报一句
+        #   「未能启动到前台（前台仍是 com.android.launcher）」
+        # —— 完全看不出是"没装"。用户看到的则是"点了开始，一直在转，没反应"。
+        #
+        # 包不存在是**确定性错误**：重试一万次也不会变。必须在动手前一次判掉，
+        # 并且把"没安装"这个事实直接说出来。
+        installed, detail = self._check_package_installed(pkg)
+        if installed is False:
+            self._log('%s 应用未安装：%s', log_prefix, detail)
+            raise AssertionError(
+                '应用「%s」未安装在这台设备上（%s）。'
+                '这不是重试能解决的问题：请先在设备上安装该 APK，'
+                '或把用例的应用配置改成设备上实际存在的包名。'
+                % (pkg, detail))
+        if installed is None:
+            # 查不到（adb 异常等）不能据此判失败，继续走原启动流程
+            self._log('%s 无法确认应用是否已安装（%s），继续尝试启动',
+                      log_prefix, detail)
         activity = getattr(self.app_config, 'app_activity', '') or ''
         last_err = ''
         fg = ''
@@ -711,6 +798,8 @@ class MidsceneAppEngine:
                         "monkey -p %s -c android.intent.category.LAUNCHER 1" % pkg)
             except Exception as exc:  # noqa: BLE001
                 last_err = str(exc)
+                # 留档给 _assert_app_foreground_or_fail 拼进最终错误
+                self._last_launch_error = last_err
                 self._log('%s 第 %d 次启动命令失败: %s',
                           log_prefix, attempt, last_err[:160])
                 # 失败常见于锁屏期间，第二次尝试前再唤醒一次
@@ -732,6 +821,48 @@ class MidsceneAppEngine:
             time.sleep(self.APP_LAUNCH_RETRY_WAIT_S)
         return False, fg
 
+    def _check_package_installed(self, pkg):
+        """检查包是否装在这台设备上。
+
+        Returns:
+            (True, '')      确认已安装
+            (False, 原因)   确认未安装 —— 调用方应立即失败，不要重试
+            (None, 原因)    查不出来（adb 异常/输出异常）—— 调用方继续走原流程
+
+        为什么必须区分这三种：只有"明确未安装"才值得短路失败；
+        查不到就判失败会在个别 ROM / adb 抽风时误杀正常用例。
+        """
+        if self._page is None:
+            return None, '尚未连接设备'
+        try:
+            out = self._page.run_adb_shell('pm list packages %s' % pkg)
+        except Exception as exc:  # noqa: BLE001
+            return None, 'adb 查询失败：%s' % str(exc)[:120]
+        text = str(out or '')
+        # ⚠️ 空输出 = **没装**，不是"查不到"（2026-11-02 自测抓到）。
+        # `pm list packages <不存在的包>` 的行为就是返回空，rc 也是 0。
+        # 若把空输出当成"无法判断"而返回 None，就又会走回"重试 3 次 × 6 秒"的老路，
+        # 本次修复等于没做。所以这里必须判 False。只有 adb 抛异常才算"查不到"。
+        found = set()
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith('package:'):
+                found.add(line[len('package:'):].strip())
+        if pkg in found:
+            return True, ''
+        if found:
+            # 只有前缀相近的包（例如要 com.x 但装的是 com.x.y）时，仍视为未装
+            return False, '设备上只有相近的包：%s' % '、'.join(sorted(found)[:3])
+        # 空结果要再确认一次 adb 是否真的正常：如果连"全部包列表"都拿不到，
+        # 那可能是 adb 抽风而非包不存在，此时返回 None 交给原流程，避免误杀。
+        try:
+            all_out = str(self._page.run_adb_shell('pm list packages') or '')
+        except Exception as exc:  # noqa: BLE001
+            return None, 'adb 复检失败：%s' % str(exc)[:120]
+        if 'package:' not in all_out:
+            return None, 'adb 返回异常（拿不到应用列表）'
+        return False, '设备的应用列表里没有这个包名'
+
     def _assert_app_foreground_or_fail(self, where='启动'):
         """启动失败/没到前台 ⇒ 抛异常终止本次执行（不再在桌面或别的 App 上乱点）。"""
         ok, fg = self._start_app(log_prefix='[%s]' % where)
@@ -740,9 +871,13 @@ class MidsceneAppEngine:
         pkg = (getattr(self.app_config, 'package_name', '') or '').strip()
         msg = ('无法把应用「%s」启动到前台（连续 %d 次后前台仍是 %s）。'
                '为避免在桌面/其它 App 上乱点，本次执行已终止。'
-               '请检查：设备是否解锁并亮屏、包名与启动 Activity 是否正确、'
-               'App 是否已安装。'
+               '请检查：设备是否解锁并亮屏、包名与启动 Activity 是否正确。'
                % (pkg or '(未配置)', self.APP_LAUNCH_RETRIES, fg or '(未知)'))
+        # 把 adb 原始错误带上：包不存在 / Activity 名写错 时，
+        # 真正的线索在 `am start` 的返回里，只报"前台仍是桌面"没法排查。
+        last_err = str(getattr(self, '_last_launch_error', '') or '')
+        if last_err:
+            msg += ' 启动命令错误：%s' % last_err[:300]
         self._log('[启动] %s', msg)
         raise AssertionError(msg)
 
