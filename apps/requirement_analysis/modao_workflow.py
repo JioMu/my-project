@@ -80,10 +80,28 @@ def _extract_block(content: str, lang: str = None) -> str:
     - 标记后不紧跟换行（如 ` ```json{...} `）
     - 缺少结束 ``` 标记（截至文末）
     - 无代码块时返回原文（供 _parse_json/_parse_yaml 直接解析裸 JSON/YAML）
+
+    ⚠️ 2026-11-04 修正（proto=92 事故）：文档**本身已是完整裸 YAML/JSON** 时，
+    绝不能因为正文中途出现 ```（例如某个字段原文里带了代码围栏）就把它当边界截断。
+    旧行为在这些场景下只返回「首个围栏内的几千字」，把 27k 行的全局摘要截成 1 个模块。
+    现策略：整份内容本身能解析成功就直接用整份；解析不了才回退到「提取首个代码块」。
     """
     if not content:
         return ''
     import re
+    # 先判断整份内容是否本身就是合法载荷（裸 YAML/JSON），是则不做任何截取
+    body = content.strip()
+    if body and not body.startswith('```'):
+        try:
+            if lang and re.search(r'(yaml|yml)', lang, re.I):
+                import yaml as _yaml
+                if isinstance(_yaml.safe_load(_strip_yaml_fence(body)), (dict, list)):
+                    return _strip_yaml_fence(body)
+            elif lang and re.search(r'json', lang, re.I):
+                if isinstance(json.loads(body), (dict, list)):
+                    return body
+        except Exception:
+            pass
     # 结束定界符：优先 ```，否则匹配到字符串末尾（兼容未闭合代码块）
     end = r'(?:```|$)'
     if lang:
@@ -108,6 +126,11 @@ def _repair_yaml_text(text: str) -> str:
 
     这里只对这类「引号成对出现、但闭合引号后仍有内容」的行做整体加引号修复，
     合法 YAML 行原样透传，不做任何其他改动。
+
+    另修一类（2026-11-04 proto=92 实测，画布「个人-个人中心」整段因此解析失败）：
+    ``priority_reason: "…新增"编辑篇章"入口…"`` —— 双引号字符串**内部又出现未转义双引号**。
+    判据：值以引号开头且以同种引号结尾，但中间还存在该引号。
+    修法：保留首尾引号，把中间的同种引号替换成中文引号（不改语义、不引入转义转义问题）。
     """
     import json as _json
     import re as _re
@@ -115,12 +138,147 @@ def _repair_yaml_text(text: str) -> str:
     for line in (text or '').split('\n'):
         # 兼容列表项形如 `- "xxx" yyy` 或 键值形如 `key: "xxx" yyy`
         m = _re.match(r'^(\s*(?:-\s*|[\w_]+:\s*))(["\'])(.*?)\2(.*)$', line)
+        # ⚠️ 排除 YAML 单引号转义串 `'''xxx''yy'`：它以两个同种引号开头，
+        # 属于合法写法，不能按「引号半包裹」重写（2026-11-04 proto=92 画布1 误伤）
+        # 判据直接看「前缀之后是否紧跟两个同种引号」（group(3) 可能为空串，不能用它判）
+        if m:
+            q_m = m.group(2)
+            rest = line[len(m.group(1)):]
+            if rest.startswith(q_m * 2):
+                out.append(line)
+                continue
         if m and m.group(4).strip():
             # 引号后还有裸文本：把引号内 + 引号外拼接后整体 JSON 转义（JSON 字符串是合法 YAML 标量）
             out.append(m.group(1) + _json.dumps(m.group(3) + m.group(4), ensure_ascii=False))
-        else:
-            out.append(line)
+            continue
+        # 值已用引号包裹，但内部还夹着同种引号 → 内部引号换成中文引号
+        # 形态覆盖：`key: "…"`、`- "…"`、`- key: "…"`（含尾随多余引号）
+        # ⚠️ 必须严格限定「值紧跟分隔符就是引号」，否则会误伤：
+        #   - `- 角色创作模块新增"心动角色测验"草稿类型…`（裸值，引号在中间，本已合法）
+        #   - `issue: '''下次进入页面''是否指…'`（三引号，本已合法）
+        m2 = _re.match(r'^(\s*(?:-\s+)?[\w_\u4e00-\u9fa5]+\s*:\s*|^\s*-\s+)(["\'])(.*)$', line)
+        if m2 and m2.group(2) in m2.group(3):
+            q, body = m2.group(2), m2.group(3)
+            # 三引号开头（YAML 里等价于单引号转义串）不处理，避免语义被改
+            if body.startswith(q):
+                out.append(line)
+                continue
+            # body 形如 `内容"编辑篇章""` 或 `内容"` —— 去掉尾部所有多余的同类引号，
+            # 只保留我们最后补的那一个
+            while body.endswith(q):
+                body = body[:-1]
+            fixed = body.replace(q, '\u201c' if q == '"' else '\u2018')
+            out.append(m2.group(1) + q + fixed + q)
+            continue
+        out.append(line)
     return '\n'.join(out)
+
+
+def _strip_yaml_fence(text: str) -> str:
+    """剥掉整份文档外层残留的 ```yaml / ``` 代码围栏。
+
+    背景（2026-11-04 生产 proto=92 实测）：落库的 requirement_summary / page_summary
+    偶发把 LLM 原样输出连代码围栏一起存了下来，`yaml.safe_load` 在围栏行直接抛
+    ``found character '`' that cannot start any token``，整份 27k 行文档解析失败，
+    阶段3 模块拆分会退化成「0 个模块」或只吃到某段围栏内的内容。
+
+    只处理「首行是围栏」与「末行是围栏」两种情形：
+    - 首行围栏 + 末行围栏 → 去掉首尾行；
+    - 仅首行围栏（末行被截断）→ 去掉首行。
+    文档中间的围栏不动（那是内容，不是边界），以免误删正文。
+    """
+    if not text:
+        return ''
+    lines = text.split('\n')
+    # 找到首个非空行
+    start = 0
+    while start < len(lines) and not lines[start].strip():
+        start += 1
+    if start < len(lines) and lines[start].strip().startswith('```'):
+        lines = lines[start + 1:]
+        # 末尾若也是围栏则一起去掉
+        end = len(lines) - 1
+        while end >= 0 and not lines[end].strip():
+            end -= 1
+        if end >= 0 and lines[end].strip().startswith('```'):
+            lines = lines[:end]
+        return '\n'.join(lines).strip()
+    return text
+
+
+_PAGE_MARK_RE = re.compile(r'^#\s*=====\s*画布：(.*?)\s*=====\s*$', re.MULTILINE)
+
+
+def _split_page_blocks(text: str):
+    """把「多画布拼接视图」切成 [(画布名, yaml 片段), ...]。
+
+    背景（2026-11-04 生产 proto=92 实测）：`_merge_page_summaries()` 把各画布 page_summary
+    用 ``# ===== 画布：<名字> =====`` 注释直接拼成一段文本存进 requirement_summary。
+    这意味着 requirement_summary **不是单个 YAML 文档**，而是 19 份文档首尾相接，
+    每份都从 ``version:`` 重新开始（顶层键重复 19 次）。
+    整份 `yaml.safe_load` 的后果：
+      ① 只要任一段带代码围栏/非法行，整份解析失败 → modules=0 → 阶段3 只拆出 0 个模块；
+      ② 即使侥幸解析成功，重复顶层键也只保留最后一份 → 只有 1 个画布的模块。
+    所以必须先切段、逐段解析、再合并。
+    """
+    if not text:
+        return []
+    marks = list(_PAGE_MARK_RE.finditer(text))
+    if not marks:
+        return []
+    blocks = []
+    for i, m in enumerate(marks):
+        start = m.end()
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        blocks.append((m.group(1).strip(), text[start:end]))
+    return blocks
+
+
+def _merge_parsed_docs(docs):
+    """把多份画布 YAML 合并成单一 dict：modules/key_features 等列表累加，标量取首个非空。"""
+    merged = {}
+    for name, doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        for key, val in doc.items():
+            if isinstance(val, list):
+                merged.setdefault(key, [])
+                if isinstance(merged[key], list):
+                    merged[key].extend(val)
+            elif isinstance(val, dict):
+                bucket = merged.setdefault(key, {})
+                if isinstance(bucket, dict):
+                    for k2, v2 in val.items():
+                        bucket.setdefault(k2, v2)
+            else:
+                # 标量：保留首个非空值，不覆盖
+                if key not in merged or merged[key] in (None, '', []):
+                    merged[key] = val
+    return merged
+
+
+def _parse_yaml_docs(text: str):
+    """解析可能由多画布拼接而成的 YAML 视图。
+
+    返回 (merged_dict, blocks_info)。blocks_info 记录每段是否解析成功，供上层日志/审计。
+    单文档输入时等价于 _parse_yaml。
+    """
+    raw = text or ''
+    blocks = _split_page_blocks(raw)
+    if not blocks:
+        return None, []
+    info, docs = [], []
+    for name, body in blocks:
+        body_clean = _strip_yaml_fence(body)
+        parsed = _parse_yaml(body_clean)
+        ok = isinstance(parsed, dict)
+        info.append({'page': name, 'ok': ok, 'bytes': len(body_clean)})
+        if ok:
+            parsed.setdefault('_page_name', name)
+            docs.append((name, parsed))
+    if not docs:
+        return None, info
+    return _merge_parsed_docs(docs), info
 
 
 def _parse_yaml(text: str):
@@ -128,14 +286,28 @@ def _parse_yaml(text: str):
         import yaml
         return yaml.safe_load(text)
     except Exception as e:
-        # 容错一：修复「引号半包裹」坏行后重试
+        # 容错一：外层代码围栏（落库内容带 ```yaml 时会导致整份解析失败）
+        stripped = _strip_yaml_fence(text or '')
+        if stripped != (text or ''):
+            try:
+                import yaml
+                result = yaml.safe_load(stripped)
+                if result is not None:
+                    logger.warning('YAML 外层代码围栏已自动剥离后解析成功')
+                    return result
+            except Exception:
+                pass
+        # 容错二：修复「引号半包裹 / 引号内嵌引号」坏行后重试
+        # （基于剥完围栏的文本修，避免围栏行干扰；两者都不需要时返回原文）
+        base = stripped if stripped != (text or '') else (text or '')
         try:
             import yaml
-            repaired = _repair_yaml_text(text)
-            if repaired != text:
+            repaired = _repair_yaml_text(base)
+            if repaired != base:
                 result = yaml.safe_load(repaired)
-                logger.warning('YAML 半包裹引号已自动修复后解析成功')
-                return result
+                if result is not None:
+                    logger.warning('YAML 引号坏行已自动修复后解析成功')
+                    return result
         except Exception:
             pass
         logger.warning(f'YAML 解析失败: {e}')
@@ -162,6 +334,53 @@ def _normalize_evidence_text(value) -> str:
     return re.sub(r'[\s，。；：、,.!?！？:;（）()【】\[\]"""\'''_—-]+', '', text)
 
 
+def _page_has_requirement_annotation(page: dict) -> bool:
+    """判断一个画布是否带有**本期需求增量证据**（用于 G6 未覆盖分母）。
+
+    实测口径（proto=70/71/82/85/88/89/92/93 全量核对）：
+      - ``annotations`` 字段在所有实测任务中恒为空列表，批注实际被并入 ``text``
+        的 ``[便利贴批注]`` 段落，因此必须查 text 而不是只看该字段；
+      - ``visual_artifacts`` **不能整体当判据**：其字段名是 ``artifact_type``（不是 type），
+        且大量条目是 ``ui_screen``（底模线框图外观，按 p0 硬约束 16 不是业务规则）
+        与 ``list_spec``（如各画布重复出现的「HanaKoi V1.10 导航菜单」全局导航清单，
+        不属于任何单个画布的变更）。若整体计入会把全部画布判成"有变更"
+        （实测 proto=93 会算出 63% 误阻断）。
+
+    因此依次检查：
+      1) ``annotations`` 非空；
+      2) ``text`` 含 ``[便利贴批注]`` / ``[需求说明]`` 等段落且段落内确有内容；
+      3) ``visual_artifacts`` 中存在**规则型**结构：annotation / rule_list /
+         state_matrix / data_table / decision_table / interaction_flow，
+         且其 raw_text 有实质长度（排除仅复述页面标题的空壳结构）。
+    """
+    if not isinstance(page, dict):
+        return False
+    if page.get('annotations'):
+        return True
+
+    text = str(page.get('text') or '')
+    for marker in ('[便利贴批注]', '[批注]', '[需求说明]'):
+        idx = text.find(marker)
+        if idx >= 0 and len(text[idx + len(marker):].strip()) >= 8:
+            return True
+
+    _RULE_TYPES = {
+        'annotation', 'rule_list', 'state_matrix', 'data_table',
+        'decision_table', 'interaction_flow', 'pricing_matrix',
+    }
+    for va in (page.get('visual_artifacts') or []):
+        if not isinstance(va, dict):
+            continue
+        atype = str(va.get('artifact_type') or va.get('type') or '').lower()
+        if atype not in _RULE_TYPES:
+            continue
+        if len(str(va.get('raw_text') or '').strip()) >= 10:
+            return True
+        if va.get('rows') or va.get('states') or va.get('steps') or va.get('rules'):
+            return True
+    return False
+
+
 def _repair_source_coverage(all_fused_requirements, valid_pages):
     """Stage-0 G6 确定性覆盖补全。
 
@@ -171,6 +390,25 @@ def _repair_source_coverage(all_fused_requirements, valid_pages):
 
     本函数在 G6 检查前，把"确有 DOM/视觉内容、但未被任何需求标注"的页面，
     归因到内容最匹配的需求上，确保每一页都在融合结果中有来源证据。
+
+    ⚠️ 2026-11-04 修正（proto=93「搜索」模块实测）：
+    ``source_pages`` 里实际混了两种东西：
+      ① 主画布名，如 ``浏览-搜索``；
+      ② 该画布的**页面状态按钮名**，如 未聚焦 / 点击聚焦 / 用户输入 / 搜索结果 / 无结果
+         （融合模型把 tab 按钮当页名写了进来，它们不是独立画布）。
+    一条 fused 需求的 ``interaction`` 本身就是「整个模块在所有状态下的完整需求文本」，
+    所以 source_pages 列多个状态名是正确的、必须保留，不能按"来源页数量"过滤。
+
+    真正有害的是原第 3) 兜底"归因到文本最长的需求"：它会把**与该模块毫无业务关系的
+    其它主画布**（annotations=0、本期无任何变更标注）也追加进 source_pages，
+    而下游阶段1 逐画布结构化正是凭 source_pages 取交集（见 _source_text_for_pages），
+    于是该模块需求被注入到每一个画布，造成跨画布串内容
+    （实测 page5「浏览-创作者信息」摘要混入搜索模块、产出 19 条无关测试点）。
+
+    修正后只保留**有真实内容关联**的归因：
+      1) 需求正文直接包含该页名；
+      2) 已标注页与该页存在父子/包含关系（tab 状态名/子页的典型形态）。
+    原来的"最长需求"兜底改为**只打 ``coverage_unattributed`` 标记、不写入 source_pages**。
     """
     if not isinstance(all_fused_requirements, list) or not valid_pages:
         return
@@ -188,14 +426,14 @@ def _repair_source_coverage(all_fused_requirements, valid_pages):
     if not uncovered:
         return
 
-    repaired = []
+    repaired, weak = [], []
     for page in uncovered:
         pname = page.get('page_name', '')
         norm = _normalize_evidence_text(pname)
         if not norm:
             continue
         target = None
-        # 1) 某条需求文本直接包含该页名
+        # 1) 某条需求文本直接包含该页名（强信号）
         for i, item in enumerate(all_fused_requirements):
             if not isinstance(item, dict):
                 continue
@@ -215,25 +453,26 @@ def _repair_source_coverage(all_fused_requirements, valid_pages):
                         break
                 if target is not None:
                     break
-        # 3) 兜底：归因到文本最长（最可能是被合并的父页）的需求
-        if target is None:
-            best_len = -1
-            for i, item in enumerate(all_fused_requirements):
-                if not isinstance(item, dict):
-                    continue
-                ln = len(json.dumps(item, ensure_ascii=False))
-                if ln > best_len:
-                    best_len = ln
-                    target = i
+        # 3) 无任何内容关联：只打弱覆盖标记，绝不写入 source_pages
+        #    （原"归因到文本最长的需求"会把无关画布全部挂到同一模块上，污染下游画布归属）
         if target is not None and isinstance(all_fused_requirements[target], dict):
             sp = all_fused_requirements[target].setdefault('source_pages', [])
             if pname not in sp:
                 sp.append(pname)
                 repaired.append(pname)
+        else:
+            page['coverage_unattributed'] = True
+            weak.append(pname)
     if repaired:
         logging.getLogger(__name__).info(
             '[STAGE0] 覆盖补全：将 %d 个未被标注的页面归因到融合需求：%s',
             len(repaired), '、'.join(repaired)
+        )
+    if weak:
+        logging.getLogger(__name__).warning(
+            '[STAGE0] 覆盖补全：%d 个页面无同源证据，仅标记 coverage_unattributed，'
+            '不写入 source_pages（避免污染下游画布归属）：%s',
+            len(weak), '、'.join(weak)
         )
 
 
@@ -1675,12 +1914,33 @@ class ModaoWorkflow:
             p for p in valid_pages
             if _normalize_evidence_text(p.get('page_name')) not in fused_source_pages
         ]
-        uncovered_ratio = len(uncovered_pages) / len(valid_pages) if valid_pages else 0
+        # ⚠️ 2026-11-04：G6 只应统计「本期确实有需求变更、却未被融合需求覆盖」的页面。
+        # 判据是**该页面是否带有需求增量证据**，实测口径如下：
+        #   ① ``annotations`` 字段在全部实测任务（proto=70/71/82/85/88/89/92/93）中恒为空，
+        #      批注实际被并入 ``text`` 的 ``[便利贴批注]`` 段落，因此不能只看该字段；
+        #   ② 不能用 ``visual_artifacts`` 判定 —— 它是视觉结构识别产物（ui_screen 线框图等），
+        #      按 p0 硬约束 16，ui_screen 只是底模外观，既不是业务规则也不是本期新增需求；
+        #      用它当"有变更"会把全部画布都算进来（实测 proto=93 会算出 63% 误阻断）。
+        # 无任何批注证据且被 _repair_source_coverage 打了 coverage_unattributed 的页面，
+        # 视为「本期无需求」，不计入分母。
+        _changed_pages = [
+            p for p in uncovered_pages
+            if _page_has_requirement_annotation(p)
+        ]
+        _no_change_pages = [p for p in uncovered_pages if p not in _changed_pages]
+        if _no_change_pages:
+            logging.getLogger(__name__).info(
+                '[STAGE0] G6：%d 个画布本期无需求批注，不计入未覆盖分母：%s',
+                len(_no_change_pages),
+                '、'.join(p.get('page_name', '') for p in _no_change_pages[:8]),
+            )
+        uncovered_pages_g6 = _changed_pages
+        uncovered_ratio = len(uncovered_pages_g6) / len(valid_pages) if valid_pages else 0
         if dual_fusion and all_fused_requirements and uncovered_ratio > 0.2:
-            uncovered_names = '、'.join(p.get('page_name', '') for p in uncovered_pages[:8])
+            uncovered_names = '、'.join(p.get('page_name', '') for p in uncovered_pages_g6[:8])
             block_reasons.append(
-                f'有 {len(uncovered_pages)} 个页面的内容未被融合需求覆盖：{uncovered_names}，'
-                f'建议检查这些页面是否有效、是否需要重新读取'
+                f'有 {len(uncovered_pages_g6)} 个页面（含本期变更标注）的内容未被融合需求覆盖：'
+                f'{uncovered_names}，建议检查这些页面是否有效、是否需要重新读取'
             )
         extraction_blocked = bool(block_reasons)
         # 部分成功（读取超时但有已读页）：**不算失败**，落库已读部分并提示可继续读取。
@@ -2067,10 +2327,10 @@ class ModaoWorkflow:
         summary = (summary_text if summary_text is not None else self.prototype.requirement_summary or '').strip()
         if not summary:
             return ''
-        try:
+        # ⚠️ 2026-11-04：多画布拼接视图必须逐段合并解析，整份 safe_load 会失败 → PCI 丢失全局关联视角
+        data, _ = _parse_yaml_docs(summary)
+        if not isinstance(data, dict):
             data = _parse_yaml(summary)
-        except Exception:
-            return ''
         if not isinstance(data, dict):
             return ''
         modules = data.get('modules') or []
@@ -2480,7 +2740,17 @@ class ModaoWorkflow:
         return self.prototype.requirement_summary
 
     def _source_text_for_pages(self, page_names: set) -> str:
-        """针对指定画布集合生成结构化输入（阶段1逐画布结构化时使用）。"""
+        """针对指定画布集合生成结构化输入（阶段1逐画布结构化时使用）。
+
+        ⚠️ 2026-11-04 语义澄清：fused 条目的 ``source_pages`` 里混着两类名字——
+          ① 主画布名（如 ``浏览-搜索``）；
+          ② 该画布的**页面状态按钮名**（如 未聚焦 / 点击聚焦 / 用户输入 / 搜索结果 / 无结果）。
+        一条 fused 需求的 ``interaction`` 本身就是「整个模块在所有状态下的完整需求」，
+        所以**不能按"来源页数量"过滤**（那会把整模块需求误杀，导致状态覆盖不全）。
+        画布归属的正确性由阶段0 的 ``_repair_source_coverage`` 保证：
+        它只允许有真实内容关联的页写入 source_pages，无关画布仅打
+        ``coverage_unattributed`` 标记而不再污染该字段。
+        """
         if self.prototype.extracted_json:
             data = json.loads(self.prototype.extracted_json)
             parts = []
@@ -2535,12 +2805,12 @@ class ModaoWorkflow:
         return '\n\n'.join(blocks)
 
     def _converged_conclusions(self) -> list:
-        """读取阶段1已收敛为确定结论的歧义点清单（供阶段2/阶段3避免重复追问）。"""
-        try:
-            import yaml as _yaml
-            data = _yaml.safe_load(self.prototype.requirement_summary or '{}') or {}
-        except Exception:
-            return []
+        """读取阶段1已收敛为确定结论的歧义点清单（供阶段2/阶段3避免重复追问）。
+
+        ⚠️ 2026-11-04：requirement_summary 是多画布拼接视图，整份 safe_load 会失败
+        （中间带代码围栏时直接抛错 → 这里恒返回空，收敛结论全部丢失）。
+        """
+        data, _ = _parse_yaml_docs(self.prototype.requirement_summary or '')
         if not isinstance(data, dict):
             return []
         return data.get('converged_conclusions') or []
@@ -3089,7 +3359,29 @@ class ModaoWorkflow:
         # 防止 LLM 在长文本中被细节淹没而漏拆相对次要的业务模块。
         # 兜底模式下 summary_text 是「原文 + 澄清结论」的自由文本，不是 YAML，不要拿去解析
         # （否则会把原文里的 "key: value" 行误解析成模块清单）。此时按「无阶段1清单」逻辑走。
-        summary_yaml = {} if summary_is_fallback else (_parse_yaml(_extract_block(summary_text or '', 'yaml')) or {})
+        # ⚠️ 2026-11-04：任务级 summary_text 是「多画布 YAML 拼接视图」，
+        # 必须逐段解析后合并，不能用 _parse_yaml/_extract_block 处理整份
+        # （实测 proto=92：整份解析失败 → expected_names 为空 → 模块拆分退化为自由发挥，
+        #   或只命中某段围栏内的 1 个画布）。
+        if summary_is_fallback:
+            summary_yaml = {}
+        elif page is not None:
+            summary_yaml = _parse_yaml(_extract_block(summary_text or '', 'yaml')) or {}
+        else:
+            merged_summary, _blocks_info = _parse_yaml_docs(summary_text or '')
+            if merged_summary:
+                summary_yaml = merged_summary
+                ok_n = sum(1 for b in _blocks_info if b['ok'])
+                if len(_blocks_info) > 1:
+                    self._log(
+                        f'需求摘要多画布合并视图：{ok_n}/{len(_blocks_info)} 段解析成功，'
+                        f'合并模块 {len(summary_yaml.get("modules") or [])} 个'
+                    )
+                if ok_n < len(_blocks_info):
+                    bad = [b['page'] for b in _blocks_info if not b['ok']]
+                    self._log(f'⚠️ 以下画布摘要解析失败（已跳过，建议重跑①结构化）：{"、".join(bad)}')
+            else:
+                summary_yaml = _parse_yaml(_extract_block(summary_text or '', 'yaml')) or {}
         summary_modules = summary_yaml.get('modules', []) if isinstance(summary_yaml, dict) else []
         expected_names = [m.get('name', '').strip() for m in summary_modules if isinstance(m, dict) and m.get('name')]
         if expected_names:
@@ -3685,9 +3977,11 @@ class ModaoWorkflow:
                 'phase': 1,
             }
         # 全局模式同样回填追溯字段（用合并后的 requirement_summary）
+        # ⚠️ 2026-11-04：必须走 _parse_yaml_docs 逐段合并，否则多画布视图只命中 1 个画布，
+        # feature_ref 回填率会被严重低估（实测 proto=92 会只拿到「个人-个人中心」的功能点）。
         try:
-            _sum_for_ref = _parse_yaml(
-                _extract_block(self.prototype.requirement_summary or '', 'yaml')) or {}
+            _sum_for_ref, _ = _parse_yaml_docs(self.prototype.requirement_summary or '')
+            _sum_for_ref = _sum_for_ref or {}
             _n = backfill_testpoint_refs(all_final_tps, _sum_for_ref)
             self._log(f'  追溯回填：{_n}/{len(all_final_tps)} 条测试点已关联功能点/接口')
         except Exception as _e:
