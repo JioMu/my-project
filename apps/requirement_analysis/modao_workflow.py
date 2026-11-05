@@ -55,17 +55,33 @@ def _wf_tlog(proto_id, msg, t0=None):
 
 
 def _timed_stage(label):
-    """装饰器：记录某个工作流阶段的开始/结束与墙钟耗时。"""
+    """装饰器：记录某个工作流阶段的开始/结束与墙钟耗时。
+
+    ⚠️ 2026-11-05：同时负责**数据库连接的进入/退出清理**。
+    墨刀工作流跑在 ``threading.Thread`` 里（无 Celery worker），而 Django 的
+    ``CONN_MAX_AGE=0`` 只在 HTTP 请求结束时关闭连接，后台线程不受请求生命周期
+    管理 —— 线程内建立的连接会一直挂在 MySQL 侧（实测累积 125/151 条 Sleep 连接，
+    单条最长 79 分钟），达到 ``max_connections`` 后全站接口报
+    ``OperationalError (1040, 'Too many connections')`` → 500。
+
+    在阶段边界调用 ``close_old_connections()``：
+      - 进入阶段前清一次，避免上一阶段残留的失效连接被继续使用；
+      - 阶段结束后（含异常）再清一次，把本阶段持有的连接归还。
+    单阶段内部长时间循环（如阶段1逐画布结构化）另有周期性清理，见 run_struct。
+    """
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(self, *a, **k):
+            from django.db import close_old_connections
             pid = self.prototype.id
             t0 = time.time()
+            close_old_connections()
             _wf_tlog(pid, f'▶ STAGE {label} START')
             try:
                 return fn(self, *a, **k)
             finally:
                 _wf_tlog(pid, f'■ STAGE {label} END', t0)
+                close_old_connections()
         return wrapper
     return deco
 
@@ -2679,6 +2695,10 @@ class ModaoWorkflow:
         if skipped:
             self._log(f'  ⏭ 增量跳过已结构化画布（不重跑）：{", ".join(_p.page_name for _p in skipped)}')
         for p in pending:
+            # ⚠️ 2026-11-05：逐画布结构化是长循环（每画布一次 LLM 调用，整段可达 40 分钟），
+            # 每轮开始前清理一次空闲连接，避免长时间占用 MySQL 连接（详见 _timed_stage 注释）。
+            from django.db import close_old_connections
+            close_old_connections()
             # 终止检查点：用户可在阶段1中途停止，已结构化的画布产物保留，可后续续跑
             if TERMINATE_REQUESTED.get(self.prototype.id):
                 TERMINATE_REQUESTED.pop(self.prototype.id, None)

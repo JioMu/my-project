@@ -705,8 +705,23 @@ def _sync_stage3(proto, user):
 
 
 def _run_in_thread(proto, target):
-    """在守护线程中执行阶段任务，异常写入 prototype.error_message。"""
+    """在守护线程中执行阶段任务，异常写入 prototype.error_message。
+
+    ⚠️ 2026-11-05：**线程结束必须关闭数据库连接**。
+    Django 的 ``CONN_MAX_AGE=0`` 仅在 HTTP 请求结束时关闭连接；后台线程不受
+    请求生命周期管理，线程跑完连接会一直挂在 MySQL 侧（实测 conn=125/151
+    全为 Sleep，单条最长 79 分钟），累积到 ``max_connections`` 后全站接口
+    报 `OperationalError (1040, 'Too many connections')` → 500。
+
+    因此这里的 wrapper 保证无论正常结束还是异常退出，都执行
+    ``close_old_connections()`` 把本线程持有的连接归还/关闭。
+    与 ``apps/ui_automation/apk_workflow.py`` 的处理方式保持一致。
+    """
+    from django.db import close_old_connections
+
     def wrapper():
+        # 进入线程先清一次：线程池/复用场景下可能残留上一个任务失效的连接
+        close_old_connections()
         try:
             proto.refresh_from_db()
             if proto.error_message:
@@ -721,6 +736,9 @@ def _run_in_thread(proto, target):
                 proto.save(update_fields=['status', 'error_message'])
             except Exception:
                 pass
+        finally:
+            # 关键：线程退出前必须关连接，否则连接泄漏直到打满 max_connections
+            close_old_connections()
     return wrapper
 
 

@@ -139,6 +139,24 @@ _SCRIPT_RE = re.compile(r'<script[^>]*>(.*?)</script>', re.S)
 # 否则逐字符扫描会退化成分钟级。剔除后纯文本通常仅数十 KB。
 _PRD_MODULE_CLS = 'requirement-module'
 _PRD_ITEM_CLS = 'prototype-item'
+# 新版 PRD 报告页（2026-11 实测「心动手表 1.3.10｜Lovin PRD」）：
+#   <section class="doc-page" data-doc-page="binding-2">   ← 需求正文载体（一个页面一块）
+#     <h2 class="page-heading">页面名</h2>
+#     <p class="page-intro">页面概述</p>
+#     <section class="state-requirement" data-state="A06">  ← 该页面的一个状态需求
+#   <section class="prototype-page" data-page="binding-2">  ← 原型截图（与 doc-page 一一对应）
+#     <article class="prototype-state" data-state="A06"><div class="prototype-card">截图</div>
+# 旧版用 requirement-module / prototype-item，新版用 doc-page / prototype-card。
+_PRD_DOC_PAGE_CLS = 'doc-page'
+_PRD_CARD_CLS = 'prototype-card'
+# 严格匹配真实 doc-page 容器标签：class 与 data-doc-page 必须同标签出现，
+# 避免正文/代码示例里提到该 class 名就被误当切分点。
+_PRD_DOC_PAGE_RE = re.compile(
+    r'<[a-zA-Z][^>]{0,300}?class="[^"]*\bdoc-page\b[^"]*"[^>]{0,300}?'
+    r'data-doc-page="[^"]+"[^>]{0,200}>'
+    r'|<[a-zA-Z][^>]{0,300}?data-doc-page="[^"]+"[^>]{0,300}?'
+    r'class="[^"]*\bdoc-page\b[^"]*"[^>]{0,200}>'
+)
 # 内联 base64 图片（data URI）：用于解析前剥离，避免超大字符串拖慢正则
 _DATA_URI_RE = re.compile(r'data:image/[^"\')]{200,}')
 # 页面标题：优先 <h4 class="prototype-title">NN标题</h4>，兜底 img 的 alt/data-title
@@ -1389,7 +1407,20 @@ class ModaoExtractor:
             return False
         n_mod = html_text.count(_PRD_MODULE_CLS)
         n_item = html_text.count(_PRD_ITEM_CLS)
-        return n_mod >= _PRD_BLOCK_SPLIT_MIN or n_item >= 2
+        if n_mod >= _PRD_BLOCK_SPLIT_MIN or n_item >= 2:
+            return True
+        # ⚠️ 2026-11-05：新版 PRD 报告页（如「心动手表 1.3.10｜Lovin PRD」）用的是
+        # `<section class="doc-page" data-doc-page="...">` 承载需求正文、
+        # `.prototype-page` / `.prototype-card` 承载截图，类名与旧版完全不同，
+        # 上面两个判据均为 0，导致三条识别路径全失效、报「未能识别该地址的内容格式」。
+        # 实测该类页面：doc-page=7、prototype-card=22、prototype-title=23。
+        # 要求**真实结构**：class="doc-page" 必须与 data-doc-page= 同标签出现，
+        # 避免正文/代码示例里提到该 class 名就被误判（实测会造成垃圾模块）。
+        n_doc = len(_PRD_DOC_PAGE_RE.findall(html_text))
+        if n_doc >= 2:
+            return True
+        n_card = html_text.count(_PRD_CARD_CLS)
+        return n_card >= 2
 
     @staticmethod
     def _html_to_text(fragment: str) -> str:
@@ -1419,6 +1450,92 @@ class ModaoExtractor:
         调用前请先剥离 data URI，否则超长字符串会显著拖慢处理。
         """
         modules: List[Dict[str, str]] = []
+        # ⚠️ 2026-11-05：新版 PRD 报告页优先按 `<section class="doc-page" data-doc-page="...">`
+        # 切分。该类页面的需求正文与状态都挂在 doc-page 内：
+        #   h2.page-heading   = 页面名（业务模块名）
+        #   p.page-intro      = 页面概述
+        #   section.state-requirement[data-state] = 每个页面状态的需求（badge 为状态名）
+        # 旧版判据（requirement-module）在该格式下计数为 0，会产出空 modules。
+        doc_starts = []
+        # ⚠️ 必须验证是**真实结构**而不是正文里提到的字样：要求同一标签内同时出现
+        # `class="doc-page"` 与 `data-doc-page=`，否则旧格式文档里引用
+        # 「新版结构使用 class="doc-page"」这类说明文字会被误当模块切分点（实测会产出
+        # `name=class="doc-page"` 这种垃圾模块，把正文拆碎）。
+        for m in _PRD_DOC_PAGE_RE.finditer(html_text):
+            doc_starts.append(m.start())
+        # 旧格式优先级更高：只要存在 requirement-module，就不走新分支，
+        # 确保历史 PRD 文档解析结果与改动前完全一致。
+        if doc_starts and html_text.count(_PRD_MODULE_CLS) >= _PRD_BLOCK_SPLIT_MIN:
+            doc_starts = []
+        if doc_starts:
+            doc_starts.append(len(html_text))
+            for i in range(len(doc_starts) - 1):
+                seg = html_text[doc_starts[i]:doc_starts[i + 1]]
+                text = cls._html_to_text(seg)
+                if not text:
+                    continue
+                hid = ''
+                m_dp = re.search(r'data-doc-page="([^"]+)"', seg[:400])
+                if m_dp:
+                    hid = m_dp.group(1)
+                name = ''
+                m_h = re.search(r'class="page-heading"[^>]*>(.*?)</h[1-6]>', seg, re.S)
+                if m_h:
+                    name = cls._html_to_text(m_h.group(1))
+                summary = ''
+                m_i = re.search(r'class="page-intro[^"]*"[^>]*>(.*?)</p>', seg, re.S)
+                if m_i:
+                    summary = cls._html_to_text(m_i.group(1))
+                # 状态清单：badge 文本 + 该状态的需求正文
+                states = []
+                # 与模块切片同理：切分点回退到所在标签的 '<'，
+                # 否则每段开头会混入 `class="state-requirement" data-state=...>` 属性残片。
+                s_positions = []
+                for mm in re.finditer(r'class="[^"]*\bstate-requirement\b[^"]*"', seg):
+                    lt = seg.rfind('<', max(0, mm.start() - 400), mm.start())
+                    s_positions.append(lt if lt >= 0 else mm.start())
+                for si, sp in enumerate(s_positions):
+                    s_end = s_positions[si + 1] if si + 1 < len(s_positions) else len(seg)
+                    sseg = seg[sp:s_end]
+                    st_name = ''
+                    m_b = re.search(r'class="state-badge"[^>]*>(.*?)</span>', sseg, re.S)
+                    if m_b:
+                        st_name = cls._html_to_text(m_b.group(1))
+                    m_st = re.search(r'data-state="([^"]+)"', sseg[:200])
+                    states.append({
+                        'state': st_name or (m_st.group(1) if m_st else f'状态{si + 1}'),
+                        'state_id': m_st.group(1) if m_st else '',
+                        'text': cls._html_to_text(sseg),
+                    })
+                if not name:
+                    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                    name = lines[0] if lines else f'需求模块{i + 1}'
+                # 把状态需求并入模块正文，确保测试点能覆盖每个状态
+                if states:
+                    st_block = '\n'.join(
+                        '[状态:%s]\n%s' % (st.get('state') or '', st.get('text') or '')
+                        for st in states)
+                    text = (text + '\n' + st_block).strip()
+                modules.append({
+                    'id': hid or f'module-{i + 1}',
+                    'name': name,
+                    'owner': '',
+                    'summary': summary,
+                    'text': text,
+                    'states': states,
+                })
+            if modules:
+                # 截图卡片页名清单（新版用 prototype-card + prototype-title）
+                proto_titles2: List[str] = []
+                for m in re.finditer(r'class="%s"' % _PRD_CARD_CLS, html_text):
+                    seg = html_text[max(0, m.start() - 200): m.start() + 1200]
+                    m_t = re.search(r'class="prototype-title"[^>]*>(.*?)</h[1-6]>', seg, re.S)
+                    if m_t:
+                        t = cls._html_to_text(m_t.group(1))
+                        if t:
+                            proto_titles2.append(re.sub(r'^[0-9０-９]+\s*', '', t))
+                return modules, proto_titles2
+
         # 需求模块：按 class 位置切片（同构、不嵌套），避免逐字符括号配对。
         # 切片起点回退到所在标签的 '<'，否则首段会混入 `class="..." id="...">` 属性文本。
         starts = []
