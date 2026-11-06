@@ -85,7 +85,7 @@
               <el-card v-for="p in fg.pages" :key="p.id" class="canvas-card" shadow="hover"
                 :class="{ 'is-failed': p.stage_status === 'failed', 'is-active': p.stage_status === 'extracting', 'is-selected': p.selected }">
                 <el-image v-if="p.screenshot" class="card-thumb" :src="shotUrl(p.screenshot)"
-                  :preview-src-list="shotPreviewList(p)" :initial-index="0" fit="contain" hide-on-click-modal>
+                  :preview-src-list="shotPreviewList(p)" :initial-index="0" fit="contain" hide-on-click-modal lazy>
                   <template #error><div class="thumb-error">截图加载失败</div></template>
                 </el-image>
                 <div class="card-thumb thumb-empty" v-else>
@@ -118,7 +118,7 @@
       </el-tab-pane>
 
       <!-- ============ Tab2：跨画布用例集合 ============ -->
-      <el-tab-pane label="用例集合" name="cases">
+      <el-tab-pane label="用例集合" name="cases" lazy>
         <div class="cases-toolbar">
           <el-select v-model="caseFilter" placeholder="按画布筛选" clearable size="small" style="width: 260px">
             <el-option label="全部画布" value="all" />
@@ -423,10 +423,13 @@ export default {
       return '/' + path
     },
     shotPreviewList(p) {
+      if (!p) return []
+      if (p._previewList) return p._previewList
       // 优先使用分段截图（超长画布被拆成多段）；否则仅主图
-      const segs = this.parseArr(p && p.screenshot_segments)
-      if (segs.length) return segs.map(s => this.shotUrl(s))
-      return p && p.screenshot ? [this.shotUrl(p.screenshot)] : []
+      const segs = this.parseArr(p.screenshot_segments)
+      const list = segs.length ? segs.map(s => this.shotUrl(s)) : (p.screenshot ? [this.shotUrl(p.screenshot)] : [])
+      p._previewList = list
+      return list
     },
     canvasLabel(p) {
       return (p.parent_name ? (p.parent_name + ' / ') : '') + (p.page_name || ('P' + p.page_no))
@@ -446,6 +449,7 @@ export default {
     },
     parseArr(s) {
       if (!s) return []
+      if (Array.isArray(s)) return s
       try {
         const v = JSON.parse(s)
         return Array.isArray(v) ? v : (v.data && Array.isArray(v.data) ? v.data : [])
@@ -486,18 +490,30 @@ export default {
         // 勾选状态以服务端为准（它已持久化），但用户刚点、还没写回完成的改动
         // 不能被轮询结果覆盖 —— 否则会出现"勾了又被弹回去"的抖动。
         const pending = this.pendingSelection
+        const oldMap = new Map((this.pages || []).map(x => [x.id, x]))
         this.pages = incoming.map(p => {
-          const old = (this.pages || []).find(x => x.id === p.id) || {}
+          const old = oldMap.get(p.id)
+          const targetSelected = (pending && Object.prototype.hasOwnProperty.call(pending, p.id)) ? pending[p.id] : p.selected
+          if (old &&
+              old.stage_status === p.stage_status &&
+              old.current_stage === p.current_stage &&
+              old.page_name === p.page_name &&
+              old.selected === targetSelected &&
+              old.error_message === p.error_message &&
+              old.recognition_note === p.recognition_note &&
+              old.screenshot === p.screenshot) {
+            return old
+          }
           return {
             ...old,
             ...p,
             // 保持可能已加载的重度业务产物不被 light 模式覆盖
-            page_summary: p.page_summary !== undefined ? p.page_summary : old.page_summary,
-            page_clarification: p.page_clarification !== undefined ? p.page_clarification : old.page_clarification,
-            page_testpoints_json: p.page_testpoints_json !== undefined ? p.page_testpoints_json : old.page_testpoints_json,
-            page_testcases_json: p.page_testcases_json !== undefined ? p.page_testcases_json : old.page_testcases_json,
-            page_smoke_json: p.page_smoke_json !== undefined ? p.page_smoke_json : old.page_smoke_json,
-            selected: (pending && Object.prototype.hasOwnProperty.call(pending, p.id)) ? pending[p.id] : p.selected,
+            page_summary: p.page_summary !== undefined ? p.page_summary : (old ? old.page_summary : undefined),
+            page_clarification: p.page_clarification !== undefined ? p.page_clarification : (old ? old.page_clarification : undefined),
+            page_testpoints_json: p.page_testpoints_json !== undefined ? p.page_testpoints_json : (old ? old.page_testpoints_json : undefined),
+            page_testcases_json: p.page_testcases_json !== undefined ? p.page_testcases_json : (old ? old.page_testcases_json : undefined),
+            page_smoke_json: p.page_smoke_json !== undefined ? p.page_smoke_json : (old ? old.page_smoke_json : undefined),
+            selected: targetSelected,
           }
         })
         if (this.focused && this.focused.id) {
@@ -541,11 +557,14 @@ export default {
         const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
         const incoming = (res.data.pages || []).slice().sort((a, b) => (a.page_no || 0) - (b.page_no || 0))
         const pending = this.pendingSelection
+        const oldMap = new Map((this.pages || []).map(x => [x.id, x]))
         this.pages = incoming.map(p => {
-          if (pending && Object.prototype.hasOwnProperty.call(pending, p.id)) {
-            return { ...p, selected: pending[p.id] }
+          const old = oldMap.get(p.id) || {}
+          return {
+            ...old,
+            ...p,
+            selected: (pending && Object.prototype.hasOwnProperty.call(pending, p.id)) ? pending[p.id] : p.selected,
           }
-          return p
         })
         // 顶层字段（testcases_json/merged_testcases_json 等）也一并补上，
         // 但保留轻量阶段已有的 proto 结构，避免覆盖掉首屏正在用的字段

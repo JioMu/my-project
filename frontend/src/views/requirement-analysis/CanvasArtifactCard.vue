@@ -227,6 +227,7 @@ export default {
     },
     /** 解析出的 JSON 数组（用于条数统计与结构化展示） */
     parsedArray() {
+      if (Array.isArray(this.raw)) return this.raw
       const t = this.rawText.trim()
       if (!t) return []
       try {
@@ -302,6 +303,7 @@ export default {
     },
     /** 从原文解析澄清数组：纯 JSON / ```json 代码块 / 首个 [...] 片段，三种策略兼容 */
     _parseClarifyArray(raw) {
+      if (Array.isArray(raw)) return raw
       const text = String(raw || '')
       if (!text.trim()) return []
       try {
