@@ -169,7 +169,7 @@
     <!-- ============ 单画布详情抽屉 ============ -->
     <el-drawer :title="focused && ((focused.parent_name ? (focused.parent_name + ' / ') : '') + 'P' + focused.page_no + ' ' + (focused.page_name || '未命名画布')) + ' · 单画布流水线'"
       v-model="drawerVisible" size="62%" direction="rtl" @closed="focused = null">
-      <div v-if="focused" class="canvas-detail">
+      <div v-if="focused" class="canvas-detail" v-loading="_fullLoading" element-loading-text="正在加载画布详细产物...">
         <el-alert type="info" :closable="false" show-icon
           :title="`当前阶段：${stageMeta(focused.current_stage, focused.stage_status).label}`"
           :description="`单画布模式：每点击一次下方按钮只会对「P${focused.page_no} ${focused.page_name || '未命名画布'}」这一个画布生效，不影响其他画布（原型允许同名画布，以 P 页码区分）。`" />
@@ -267,6 +267,8 @@ export default {
       // 一旦补拉过，后续轮询也必须用全量，避免把抽屉/用例集合刚拿到的大字段清掉。
       _fullLoaded: false,
       _fullLoading: false,
+      _polling: false,
+      pollFailCount: 0,
     }
   },
   computed: {
@@ -460,48 +462,67 @@ export default {
       }
     },
     async loadDetail() {
+      if (this._polling) return
+      this._polling = true
       this.loading = true
       try {
-        // 首屏只拉轻量数据（?light=1）：完整详情实测 2113KB/5s，
-        // 其中 1091KB 是逐页用例产物，而画布卡片一个都不渲染。
-        // 轻量模式约 112KB（-95%）；切「用例集合」tab 或开「进入当前阶段」抽屉时
-        // 再由 ensureFullDetail() 补拉全量。
-        //
-        // ⚠️ 一旦拉过全量（_fullLoaded），之后的轮询也必须用全量：
-        // 否则 3 秒后 openCanvas/用例集合 刚拿到的 page_testcases_json 等
-        // 会被轻量响应覆盖掉，抽屉内容"闪一下又空了"。
-        const needFull = this._fullLoaded || this.drawerVisible || this.activeTab === 'cases'
-        const params = needFull ? {} : { light: 1 }
-        const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get', params })
-        this.proto = res.data
-        if (needFull) {
-          this._fullLoaded = true
+        // 性能与防超时修复（2026-11-06）：
+        // 轮询一律使用轻量模式（?light=1），仅跟踪画布状态和任务进度（约 112KB / 0.5s）。
+        // 绝不反复轮询全量详情（6.8MB），彻底避免网络与 Socket 队列拥塞导致 300000ms 超时。
+        // 全量业务产物（用例/测试点/摘要）由 ensureFullDetail() 按需拉取并缓存在内存中。
+        const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get', params: { light: 1 } })
+
+        // 合并 proto 基础状态字段，保留已有的全量重度字段
+        this.proto = {
+          ...this.proto,
+          ...res.data,
+          testcases_json: res.data.testcases_json !== undefined ? res.data.testcases_json : this.proto?.testcases_json,
+          final_testpoints_json: res.data.final_testpoints_json !== undefined ? res.data.final_testpoints_json : this.proto?.final_testpoints_json,
+          extracted_json: res.data.extracted_json !== undefined ? res.data.extracted_json : this.proto?.extracted_json,
+          smoke_json: res.data.smoke_json !== undefined ? res.data.smoke_json : this.proto?.smoke_json,
         }
+
         const incoming = (res.data.pages || []).slice().sort((a, b) => (a.page_no || 0) - (b.page_no || 0))
         // 勾选状态以服务端为准（它已持久化），但用户刚点、还没写回完成的改动
         // 不能被轮询结果覆盖 —— 否则会出现"勾了又被弹回去"的抖动。
         const pending = this.pendingSelection
         this.pages = incoming.map(p => {
-          if (pending && Object.prototype.hasOwnProperty.call(pending, p.id)) {
-            return { ...p, selected: pending[p.id] }
+          const old = (this.pages || []).find(x => x.id === p.id) || {}
+          return {
+            ...old,
+            ...p,
+            // 保持可能已加载的重度业务产物不被 light 模式覆盖
+            page_summary: p.page_summary !== undefined ? p.page_summary : old.page_summary,
+            page_clarification: p.page_clarification !== undefined ? p.page_clarification : old.page_clarification,
+            page_testpoints_json: p.page_testpoints_json !== undefined ? p.page_testpoints_json : old.page_testpoints_json,
+            page_testcases_json: p.page_testcases_json !== undefined ? p.page_testcases_json : old.page_testcases_json,
+            page_smoke_json: p.page_smoke_json !== undefined ? p.page_smoke_json : old.page_smoke_json,
+            selected: (pending && Object.prototype.hasOwnProperty.call(pending, p.id)) ? pending[p.id] : p.selected,
           }
-          return p
         })
         if (this.focused && this.focused.id) {
-          // 保持抽屉聚焦对象同步到更新后的新页面对象（loadDetail 会替换 pages 数组）
+          // 保持抽屉聚焦对象同步到更新后的新页面对象（保留已有的重字段）
           const fid = this.focused.id
           const found = (this.pages || []).find(x => x.id === fid)
           if (found) this.focused = found
         }
+        this.pollFailCount = 0
         if (this.isRunning) {
           this.startPoll()
         } else {
           this.stopPoll()
         }
       } catch (e) {
-        this.$message.error('加载失败：' + (e.response?.data?.detail || e.message))
+        this.pollFailCount = (this.pollFailCount || 0) + 1
+        if (this.pollFailCount >= 5) {
+          this.stopPoll()
+          this.$message.error('加载失败次数过多已停止轮询：' + (e.response?.data?.detail || e.message))
+        } else {
+          console.warn('[canvas-board] 轮询刷新失败:', e?.message)
+        }
       } finally {
         this.loading = false
+        this._polling = false
       }
     },
     /**
