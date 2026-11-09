@@ -808,6 +808,8 @@ class ModaoPage(models.Model):
             self.work_log = (self.work_log or '') + f'[{ts}] {log}\n'
         if error is not None:
             self.error_message = error
+        elif status == 'done':
+            self.error_message = ''
 
 
 

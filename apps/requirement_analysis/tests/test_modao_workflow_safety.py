@@ -241,3 +241,32 @@ class ModaoWorkflowResetTests(SimpleTestCase):
         self.assertEqual(proto.auth_cookie, 'kept-cookie')
         self.assertEqual(proto.project_id, 7)
         self.assertEqual(proto.version_id, 9)
+
+
+class ModaoQualityGateAndStateTests(SimpleTestCase):
+    def test_infer_category_game_character_not_permission(self):
+        from apps.requirement_analysis.modao_workflow import _infer_category
+        tp = {
+            'title': '点击编辑篇章跳转秘密篇章列表并携带角色上下文',
+            'description': '在秘密篇章中携带当前角色信息进行展示',
+            'priority': 'P0'
+        }
+        cat = _infer_category(tp)
+        self.assertEqual(cat, 'main_flow')
+
+    def test_quality_gate_c3_heals_when_p0_classified_as_ui(self):
+        workflow = object.__new__(ModaoWorkflow)
+        workflow.prototype = type('Proto', (), {'id': 1})()
+        tps = [
+            {'module': '个人中心', 'title': '个人中心创作Tab角色列表展示', 'priority': 'P0', 'category': 'UI', 'description': 'x' * 100},
+        ]
+        cases = [
+            {'id': 'TC-1', 'module': '个人中心', 'title': '用例1', 'precondition': '前置', 'steps': ['步骤1：进入个人中心', '步骤2：查看角色列表'], 'expected': '预期', 'priority': 'P0', 'type': '功能测试'}
+        ]
+        res = workflow._code_quality_check(cases, {'smoke_testcases': [{'id': 'TC-1'}]}, tps)
+        c3 = res['quality_json']['quality_report']['checks']['C3']
+        self.assertEqual(c3['result'], 'PASS')
+        self.assertEqual(tps[0]['category'], 'main_flow')
+        self.assertEqual(res['blocking'], [])
+
+

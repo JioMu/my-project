@@ -106,7 +106,7 @@
                 <div class="card-meta">
                   <span>识别摘要：{{ p.recognition_note || '无' }}</span>
                 </div>
-                <div v-if="p.error_message" class="card-error">⚠ {{ p.error_message }}</div>
+                <div v-if="p.error_message && p.stage_status === 'failed'" class="card-error">⚠ {{ p.error_message }}</div>
                 <div class="card-actions">
                   <el-button type="primary" size="small" @click="openCanvas(p)">进入当前阶段</el-button>
                   <el-button size="small" @click="openCanvas(p)">查看产物</el-button>
