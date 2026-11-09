@@ -1832,6 +1832,15 @@ onMounted(async () => {
 </script>
 
 <style lang="scss" scoped>
+/* 只作用于本页：统一中文字体栈 + 字形平滑，字号体系按 12/12.5/15 三档收敛 */
+.page-container {
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  color: #1f2329;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
 .table-wrapper {
   width: 100%;
   overflow-x: auto;
@@ -1841,16 +1850,28 @@ onMounted(async () => {
 .view-bar {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 12px;
+  gap: 12px;
+  margin-bottom: 14px;
 }
 .view-bar-label {
   font-size: 13px;
-  color: #909399;
+  font-weight: 500;
+  color: #646a73;
 }
 .view-bar-hint {
   font-size: 12px;
-  color: #b1b3b8;
+  color: #a8abb2;
+}
+.view-bar :deep(.el-radio-button__inner) {
+  padding: 6px 14px;
+  font-size: 13px;
+  border-radius: 6px;
+}
+.view-bar :deep(.el-radio-button:first-child .el-radio-button__inner) {
+  border-radius: 6px 0 0 6px;
+}
+.view-bar :deep(.el-radio-button:last-child .el-radio-button__inner) {
+  border-radius: 0 6px 6px 0;
 }
 
 /* ---------- 卡片视图 ---------- */
@@ -1859,7 +1880,7 @@ onMounted(async () => {
   /* 一行一条用例：卡片铺满整行，步骤与预期不再被窄列挤压换行 */
   grid-template-columns: 1fr;
   align-items: start;
-  gap: 12px;
+  gap: 14px;
   min-height: 60px;
 }
 .card-empty {
@@ -1872,48 +1893,84 @@ onMounted(async () => {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 14px 16px 12px;
+  gap: 11px;
+  padding: 16px 18px 14px;
   background: #fff;
-  border: 1px solid #ebeef5;
-  border-radius: 8px;
-  transition: border-color 0.2s, box-shadow 0.2s;
+  border: 1px solid #eef0f4;
+  border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(31, 35, 41, 0.04);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+}
+/* 左侧色条：选中时才点亮，平时不占视觉 */
+.case-card::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 16px;
+  bottom: 16px;
+  width: 3px;
+  background: transparent;
+  border-radius: 0 3px 3px 0;
+  transition: background 0.2s ease;
 }
 .case-card:hover {
-  border-color: #c6e2ff;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+  border-color: #d9e6f7;
+  box-shadow: 0 4px 16px rgba(31, 35, 41, 0.08);
+  transform: translateY(-1px);
 }
 .case-card.is-selected {
-  border-color: #409eff;
-  box-shadow: 0 0 0 1px #409eff inset;
+  border-color: #a3ccff;
+  background: #f7fbff;
+  box-shadow: 0 4px 16px rgba(64, 158, 255, 0.12);
+}
+.case-card.is-selected::before {
+  background: #409eff;
 }
 
 .card-head {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
+  gap: 9px;
 }
 .card-index {
   flex: none;
-  margin-top: 1px;
-  font-size: 12px;
-  color: #909399;
+  margin-top: 2px;
+  padding: 0 6px;
+  height: 18px;
+  line-height: 18px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #8a9099;
+  background: #f2f4f7;
+  border-radius: 4px;
   font-variant-numeric: tabular-nums;
 }
 .card-title {
   flex: 1;
   min-width: 0;
-  font-size: 14px;
-  font-weight: 500;
+  font-size: 15px;
+  font-weight: 600;
   line-height: 1.5;
+  color: #1f2329;
   word-break: break-word;
+  transition: color 0.2s ease;
+}
+.case-card:hover .card-title {
+  color: #2d7ff9;
 }
 
 .card-tags {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+}
+.card-tags :deep(.el-tag) {
+  height: 22px;
+  line-height: 20px;
+  padding: 0 8px;
+  font-size: 12px;
+  border-radius: 5px;
 }
 
 /* 用例正文：三栏横向铺满（前置条件 / 操作步骤 / 预期结果） */
@@ -1922,21 +1979,21 @@ onMounted(async () => {
   grid-template-columns: 0.85fr 1.5fr 1fr;
   align-items: stretch;
   overflow: hidden;
-  background: #fafbfc;
-  border: 1px solid #f0f2f5;
-  border-radius: 6px;
+  background: #f8f9fb;
+  border: 1px solid #f2f3f5;
+  border-radius: 8px;
 }
 .card-block {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 5px;
   min-width: 0;
   max-height: 240px;
   overflow-y: auto;
-  padding: 10px 14px;
+  padding: 11px 15px;
 }
 .card-block + .card-block {
-  border-left: 1px solid #f0f2f5;
+  border-left: 1px solid #eceef1;
 }
 .card-block::-webkit-scrollbar {
   width: 6px;
@@ -1954,9 +2011,10 @@ onMounted(async () => {
   align-items: center;
   flex: none;
   margin-bottom: 2px;
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 600;
-  color: #606266;
+  letter-spacing: 0.2px;
+  color: #464b52;
 }
 .block-label::before {
   content: '';
@@ -1979,9 +2037,9 @@ onMounted(async () => {
   border-radius: 8px;
 }
 .block-text {
-  font-size: 12px;
-  line-height: 1.7;
-  color: #303133;
+  font-size: 12.5px;
+  line-height: 1.72;
+  color: #2f343a;
   word-break: break-word;
 }
 .block-empty {
@@ -1996,11 +2054,11 @@ onMounted(async () => {
 }
 .block-list li {
   position: relative;
-  padding-left: 21px;
-  margin-bottom: 6px;
-  font-size: 12px;
-  line-height: 1.7;
-  color: #303133;
+  padding-left: 22px;
+  margin-bottom: 7px;
+  font-size: 12.5px;
+  line-height: 1.72;
+  color: #2f343a;
   word-break: break-word;
 }
 .block-list li:last-child {
@@ -2070,11 +2128,11 @@ onMounted(async () => {
 }
 .card-type {
   font-size: 12px;
-  color: #909399;
+  color: #a3a8ae;
 }
 .card-muted {
   font-size: 12px;
-  color: #b1b3b8;
+  color: #bcc0c5;
 }
 
 .card-meta {
@@ -2100,12 +2158,12 @@ onMounted(async () => {
 .card-field b {
   flex: none;
   width: 40px;
-  color: #909399;
+  color: #a3a8ae;
   font-weight: 400;
 }
 .card-field em {
   min-width: 0;
-  color: #303133;
+  color: #464b52;
   font-style: normal;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2113,6 +2171,7 @@ onMounted(async () => {
 }
 .card-field .mini-tag {
   margin-right: 4px;
+  border-radius: 4px;
 }
 
 .card-foot {
@@ -2121,20 +2180,25 @@ onMounted(async () => {
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
-  padding-top: 8px;
-  border-top: 1px dashed #ebeef5;
+  padding-top: 10px;
+  border-top: 1px solid #f2f3f5;
 }
 .card-sub {
   font-size: 12px;
-  color: #909399;
+  color: #a8abb2;
 }
 .card-actions {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
 }
+/* 操作按钮压到次要层级，hover 卡片时才显眼 */
 .card-actions .el-button {
   margin-left: 0;
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 6px;
 }
 
 .filter-bar {
@@ -2234,9 +2298,22 @@ onMounted(async () => {
 }
 
 .pagination-container {
-  margin-top: 20px;
+  margin-top: 18px;
   display: flex;
   justify-content: center;
+}
+.pagination-container :deep(.el-pagination) {
+  font-size: 13px;
+}
+.pagination-container :deep(.el-pager li) {
+  min-width: 30px;
+  height: 30px;
+  line-height: 30px;
+  border-radius: 6px;
+  font-weight: 400;
+}
+.pagination-container :deep(.el-pager li.is-active) {
+  font-weight: 600;
 }
 
 .header-actions {
