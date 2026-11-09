@@ -29,8 +29,15 @@
         <el-option label="P3" value="P3" />
       </el-select>
       <el-input v-model="keywordFilter" placeholder="搜索用例标题..." clearable size="small" style="width: 200px" />
+      <el-checkbox v-model="showAdopted" size="small" class="show-adopted-toggle">显示已采纳</el-checkbox>
       <div class="filter-stats">
-        共 {{ displayCases.length }} 条 / 已选 {{ selectedCases.length }} 条 / 已采纳(已隐藏) {{ adoptedCount }} 条
+        共 {{ displayCases.length }} 条 / 已选 {{ selectedCases.length }} 条
+        <template v-if="hiddenAdoptedCount">
+          / 已采纳(已隐藏) <b>{{ hiddenAdoptedCount }}</b> 条
+        </template>
+        <template v-else-if="adoptedCount">
+          / 其中已采纳 <b>{{ adoptedCount }}</b> 条
+        </template>
       </div>
     </div>
 
@@ -106,6 +113,18 @@
           >采纳</el-button>
         </template>
       </el-table-column>
+      <template #empty>
+        <div class="empty-hint">
+          <template v-if="hiddenAdoptedCount">
+            当前筛选下的 <b>{{ hiddenAdoptedCount }}</b> 条用例已全部采纳并隐藏，避免重复采纳。
+            <el-button link type="primary" size="small" @click="showAdopted = true">
+              显示已采纳的用例
+            </el-button>
+          </template>
+          <template v-else-if="!allCases.length">该原型还没有生成用例</template>
+          <template v-else>当前筛选条件下没有用例</template>
+        </div>
+      </template>
     </el-table>
 
     <!-- 冒烟用例 -->
@@ -196,6 +215,17 @@
             >{{ adoptedKeys[row._key] ? '已采纳' : '采纳' }}</el-button>
           </template>
         </el-table-column>
+        <template #empty>
+          <div class="empty-hint">
+            <template v-if="hiddenAdoptedSmokeCount">
+              当前筛选下的 <b>{{ hiddenAdoptedSmokeCount }}</b> 条冒烟用例已全部采纳并隐藏。
+              <el-button link type="primary" size="small" @click="showAdopted = true">
+                显示已采纳的用例
+              </el-button>
+            </template>
+            <template v-else>当前筛选条件下没有冒烟用例</template>
+          </div>
+        </template>
       </el-table>
     </div>
 
@@ -404,6 +434,8 @@ export default {
       // 人工新增用例（人工补充）：暂存后随「采纳选中」一并入库
       manualCases: [],
       manualSeq: 0,
+      // 已采纳用例默认隐藏；勾选后一并展示（行仍不可再次勾选，按钮显示「已采纳」）
+      showAdopted: false,
       // 行状态：key = `${pageId}#${index}`（冒烟加 smoke# 前缀）
       adoptedKeys: {},
       editedKeys: {},
@@ -501,16 +533,26 @@ export default {
         return true
       })
     },
-    /** 已采纳（已入库）的用例直接隐藏，避免重复采纳 */
+    /** 已采纳（已入库）的用例默认隐藏，避免重复采纳；勾选「显示已采纳」后仍可查看 */
     displayCases() {
-      return this.filteredCases.filter(c => !this.adoptedKeys[c._key])
+      return this.filteredCases.filter(
+        c => this.showAdopted || !this.adoptedKeys[c._key])
     },
     displaySmoke() {
-      return this.filteredSmoke.filter(c => !this.adoptedKeys[c._key])
+      return this.filteredSmoke.filter(
+        c => this.showAdopted || !this.adoptedKeys[c._key])
     },
     adoptedCount() {
       // 仅统计当前普通用例中已采纳（已入库）的数量，排除冒烟用例 key
       return this.filteredCases.filter(c => this.adoptedKeys[c._key]).length
+    },
+    /** 当前被隐藏的已采纳条数（勾选「显示已采纳」后为 0） */
+    hiddenAdoptedCount() {
+      return this.showAdopted ? 0 : this.adoptedCount
+    },
+    hiddenAdoptedSmokeCount() {
+      return this.showAdopted ? 0
+        : this.filteredSmoke.filter(c => this.adoptedKeys[c._key]).length
     },
     currentKey() {
       return this.current ? this.current._key : ''
@@ -1094,6 +1136,15 @@ export default {
     border-radius: 8px;
     flex-wrap: wrap;
     .filter-stats { margin-left: auto; color: #606266; font-size: 13px; }
+    .show-adopted-toggle { margin-left: 8px; }
+  }
+
+  .empty-hint {
+    padding: 18px 0;
+    color: #909399;
+    font-size: 13px;
+    line-height: 1.9;
+    b { color: #e6a23c; }
   }
 
   .batch-actions {
