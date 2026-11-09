@@ -334,27 +334,41 @@
           :class="{ 'is-selected': isCardSelected(row) }"
         >
           <div class="card-head">
-            <el-checkbox
-              :model-value="isCardSelected(row)"
-              @change="(v) => toggleCardSelect(row, v)"
-            />
-            <span class="card-index">#{{ getSerialNumber(idx) }}</span>
-            <el-link class="card-title" type="primary" @click="goToTestCase(row.id)">
-              {{ row.title }}
-            </el-link>
-            <el-tag v-if="row.steps && row.steps.includes('【步骤缺失')" size="small" type="danger">
-              步骤缺失
-            </el-tag>
-          </div>
-
-          <div class="card-tags">
-            <el-tag :class="`priority-tag ${row.priority}`" size="small">{{ getPriorityText(row.priority) }}</el-tag>
-            <el-tag :type="getStatusType(row.status)" size="small">{{ getStatusText(row.status) }}</el-tag>
-            <el-tag :type="getSourceType(row.source)" size="small">{{ getSourceText(row.source) }}</el-tag>
-            <el-tag v-if="row.latest_execution_result === 'pass'" type="success" size="small">✅ 通过</el-tag>
-            <el-tag v-else-if="row.latest_execution_result === 'fail'" type="danger" size="small">❌ 失败</el-tag>
-            <span v-else class="card-muted">未执行</span>
-            <span v-if="row.test_type" class="card-type">{{ getTypeText(row.test_type) }}</span>
+            <div class="head-main">
+              <el-checkbox
+                class="head-check"
+                :model-value="isCardSelected(row)"
+                @change="(v) => toggleCardSelect(row, v)"
+              />
+              <div class="head-text">
+                <div class="title-row">
+                  <el-link class="card-title" type="primary" @click="goToTestCase(row.id)">
+                    {{ row.title }}
+                  </el-link>
+                  <el-tag v-if="row.steps && row.steps.includes('【步骤缺失')" size="small" type="danger">
+                    步骤缺失
+                  </el-tag>
+                </div>
+                <div class="card-subline">
+                  <span class="subline-no">#{{ getSerialNumber(idx) }}</span>
+                  <span v-if="row.project?.name" class="subline-dot">·</span>
+                  <span v-if="row.project?.name">{{ row.project.name }}</span>
+                  <template v-if="row.test_point?.name">
+                    <span class="subline-dot">·</span>
+                    <span>{{ row.test_point.name }}</span>
+                  </template>
+                </div>
+              </div>
+            </div>
+            <div class="card-tags">
+              <el-tag :class="`priority-tag ${row.priority}`" size="small">{{ getPriorityText(row.priority) }}</el-tag>
+              <el-tag :type="getStatusType(row.status)" size="small">{{ getStatusText(row.status) }}</el-tag>
+              <el-tag :type="getSourceType(row.source)" size="small">{{ getSourceText(row.source) }}</el-tag>
+              <el-tag v-if="row.latest_execution_result === 'pass'" type="success" size="small">✅ 通过</el-tag>
+              <el-tag v-else-if="row.latest_execution_result === 'fail'" type="danger" size="small">❌ 失败</el-tag>
+              <span v-else class="card-muted">未执行</span>
+              <span v-if="row.test_type" class="card-type">{{ getTypeText(row.test_type) }}</span>
+            </div>
           </div>
 
           <!-- 用例正文：左前置条件 / 中操作步骤 / 右预期结果，逐条拆分渲染 -->
@@ -1893,11 +1907,11 @@ onMounted(async () => {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 11px;
-  padding: 16px 18px 14px;
+  gap: 16px;
+  padding: 20px 22px 18px;
   background: #fff;
   border: 1px solid #eef0f4;
-  border-radius: 12px;
+  border-radius: 14px;
   box-shadow: 0 1px 2px rgba(31, 35, 41, 0.04);
   transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
 }
@@ -1930,27 +1944,37 @@ onMounted(async () => {
 .card-head {
   display: flex;
   align-items: flex-start;
-  gap: 9px;
+  justify-content: space-between;
+  gap: 20px;
 }
-.card-index {
+.head-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+.head-check {
   flex: none;
-  margin-top: 2px;
-  padding: 0 6px;
-  height: 18px;
-  line-height: 18px;
-  font-size: 11px;
-  font-weight: 600;
-  color: #8a9099;
-  background: #f2f4f7;
-  border-radius: 4px;
-  font-variant-numeric: tabular-nums;
+  margin-top: 4px;
+  height: auto;
+}
+.head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .card-title {
-  flex: 1;
   min-width: 0;
-  font-size: 15px;
+  font-size: 20px;
   font-weight: 600;
-  line-height: 1.5;
+  line-height: 1.35;
   color: #1f2329;
   word-break: break-word;
   transition: color 0.2s ease;
@@ -1958,12 +1982,39 @@ onMounted(async () => {
 .case-card:hover .card-title {
   color: #2d7ff9;
 }
+.card-subline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #9298a0;
+}
+.subline-no {
+  font-variant-numeric: tabular-nums;
+}
+.subline-dot {
+  color: #d4d7dc;
+}
 
 .card-tags {
   display: flex;
+  flex: none;
   flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
+  max-width: 48%;
+}
+@media (max-width: 1100px) {
+  .card-head {
+    flex-direction: column;
+    gap: 12px;
+  }
+  .card-tags {
+    justify-content: flex-start;
+    max-width: 100%;
+  }
 }
 .card-tags :deep(.el-tag) {
   height: 22px;
@@ -1974,26 +2025,23 @@ onMounted(async () => {
 }
 
 /* 用例正文：三栏横向铺满（前置条件 / 操作步骤 / 预期结果） */
+/* 三栏各自是独立浅色卡片，不是被分隔线切开的一整块 */
 .card-body {
   display: grid;
   grid-template-columns: 0.85fr 1.5fr 1fr;
   align-items: stretch;
-  overflow: hidden;
-  background: #f8f9fb;
-  border: 1px solid #f2f3f5;
-  border-radius: 8px;
+  gap: 14px;
 }
 .card-block {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 12px;
   min-width: 0;
-  max-height: 240px;
+  max-height: 280px;
   overflow-y: auto;
-  padding: 11px 15px;
-}
-.card-block + .card-block {
-  border-left: 1px solid #eceef1;
+  padding: 12px;
+  background: #f8f9fc;
+  border-radius: 10px;
 }
 .card-block::-webkit-scrollbar {
   width: 6px;
@@ -2002,43 +2050,33 @@ onMounted(async () => {
   background: #dcdfe6;
   border-radius: 3px;
 }
-/* 步骤栏最宽，视觉重心在这里 */
-.block-main .block-label::before {
-  background: #409eff;
-}
+/* 栏标题做成浅蓝横条 + 左侧蓝条，与正文区拉开层次 */
 .block-label {
   display: flex;
   align-items: center;
   flex: none;
-  margin-bottom: 2px;
-  font-size: 12.5px;
+  padding: 9px 12px;
+  font-size: 14px;
   font-weight: 600;
   letter-spacing: 0.2px;
-  color: #464b52;
-}
-.block-label::before {
-  content: '';
-  display: inline-block;
-  width: 3px;
-  height: 11px;
-  margin-right: 6px;
-  vertical-align: -1px;
-  background: #c0c4cc;
-  border-radius: 2px;
+  color: #1f2329;
+  background: linear-gradient(90deg, #e9f2ff 0%, #f3f8ff 76%, rgba(243, 248, 255, 0) 100%);
+  border-left: 3px solid #2d7ff9;
+  border-radius: 6px;
 }
 .block-count {
   margin-left: 6px;
-  padding: 0 5px;
+  padding: 0 6px;
   font-size: 11px;
   font-weight: 400;
-  line-height: 16px;
-  color: #909399;
-  background: #f0f2f5;
-  border-radius: 8px;
+  line-height: 17px;
+  color: #5b8fd6;
+  background: rgba(45, 127, 249, 0.1);
+  border-radius: 9px;
 }
 .block-text {
-  font-size: 12.5px;
-  line-height: 1.72;
+  font-size: 13px;
+  line-height: 1.75;
   color: #2f343a;
   word-break: break-word;
 }
@@ -2048,57 +2086,46 @@ onMounted(async () => {
 /* 逐条列表：序号用小圆标，条目之间留白，比整段文字好扫读 */
 .block-list {
   margin: 0;
-  padding: 0;
+  padding: 0 4px;
   list-style: none;
   counter-reset: block-item;
 }
 .block-list li {
   position: relative;
-  padding-left: 22px;
-  margin-bottom: 7px;
-  font-size: 12.5px;
-  line-height: 1.72;
+  padding-left: 32px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  line-height: 1.75;
   color: #2f343a;
   word-break: break-word;
 }
 .block-list li:last-child {
   margin-bottom: 0;
 }
+/* 条目序号：浅蓝圆形徽标，配合大间距让每步独立成块 */
 .block-list li::before {
   counter-increment: block-item;
   content: counter(block-item);
   position: absolute;
   left: 0;
-  top: 2px;
-  width: 15px;
-  height: 15px;
-  font-size: 10px;
-  line-height: 15px;
+  top: 1px;
+  width: 21px;
+  height: 21px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 21px;
   text-align: center;
-  color: #909399;
-  background: #f0f2f5;
+  color: #2d7ff9;
+  background: #e6f0ff;
   border-radius: 50%;
 }
-/* 步骤用蓝底，预期用绿底，前置灰底，扫读时先抓步骤和预期 */
-.block-main .block-list li::before {
-  color: #409eff;
-  background: #ecf5ff;
-}
-.card-block:nth-child(3) .block-list li::before {
-  color: #67c23a;
-  background: #f0f9eb;
-}
-/* 窄屏回落为纵向堆叠，避免三栏被压得过窄 */
+/* 窄屏回落为纵向堆叠 */
 @media (max-width: 1200px) {
   .card-body {
     grid-template-columns: 1fr;
   }
   .card-block {
     max-height: none;
-  }
-  .card-block + .card-block {
-    border-left: none;
-    border-top: 1px solid #f0f2f5;
   }
 }
 /* v-html 内容不受 scoped 约束，需 deep 才能收紧默认段落间距 */
