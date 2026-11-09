@@ -357,13 +357,13 @@
             <span v-if="row.test_type" class="card-type">{{ getTypeText(row.test_type) }}</span>
           </div>
 
-          <!-- 用例正文：前置条件 / 操作步骤 / 预期结果（与详情页同样按富文本渲染） -->
+          <!-- 用例正文：左前置条件 / 中操作步骤 / 右预期结果，横向三栏铺满宽度 -->
           <div class="card-body">
-            <div v-if="row.preconditions" class="card-block">
-              <div class="block-label">前置条件</div>
-              <div class="block-text" v-html="row.preconditions"></div>
-            </div>
             <div class="card-block">
+              <div class="block-label">前置条件</div>
+              <div class="block-text" v-html="row.preconditions || '无'"></div>
+            </div>
+            <div class="card-block block-main">
               <div class="block-label">操作步骤</div>
               <div class="block-text" v-html="row.steps || '无'"></div>
             </div>
@@ -1857,29 +1857,38 @@ onMounted(async () => {
   gap: 6px;
 }
 
-/* 用例正文：前置条件 / 操作步骤 / 预期结果 */
+/* 用例正文：三栏横向铺满（前置条件 / 操作步骤 / 预期结果） */
 .card-body {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  max-height: 320px;
-  overflow-y: auto;
-  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: 0.85fr 1.5fr 1fr;
+  align-items: stretch;
+  overflow: hidden;
   background: #fafbfc;
   border: 1px solid #f0f2f5;
   border-radius: 6px;
 }
-.card-body::-webkit-scrollbar {
-  width: 6px;
-}
-.card-body::-webkit-scrollbar-thumb {
-  background: #dcdfe6;
-  border-radius: 3px;
-}
 .card-block {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
+  min-width: 0;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 10px 14px;
+}
+.card-block + .card-block {
+  border-left: 1px solid #f0f2f5;
+}
+.card-block::-webkit-scrollbar {
+  width: 6px;
+}
+.card-block::-webkit-scrollbar-thumb {
+  background: #dcdfe6;
+  border-radius: 3px;
+}
+/* 步骤栏最宽，视觉重心在这里 */
+.block-main .block-label::before {
+  background: #67c23a;
 }
 .block-label {
   flex: none;
@@ -1905,6 +1914,19 @@ onMounted(async () => {
   /* 实测 steps/expected_result 是「1. xxx\n2. xxx」纯文本，不是 HTML；
      不加 pre-wrap 会被折叠成一行。富文本紧凑 HTML 下 pre-wrap 也不影响渲染。 */
   white-space: pre-wrap;
+}
+/* 窄屏回落为纵向堆叠，避免三栏被压得过窄 */
+@media (max-width: 1200px) {
+  .card-body {
+    grid-template-columns: 1fr;
+  }
+  .card-block {
+    max-height: none;
+  }
+  .card-block + .card-block {
+    border-left: none;
+    border-top: 1px solid #f0f2f5;
+  }
 }
 /* v-html 内容不受 scoped 约束，需 deep 才能收紧默认段落间距 */
 .card-body :deep(.block-text p) {
