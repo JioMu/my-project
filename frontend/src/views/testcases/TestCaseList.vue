@@ -176,7 +176,25 @@
         </div>
       </div>
       
-      <div class="table-wrapper">
+      <!-- 展示方式切换：列表 / 卡片（选择状态两者互通） -->
+      <div class="view-bar">
+        <span class="view-bar-label">展示方式</span>
+        <el-radio-group v-model="viewMode" size="small">
+          <el-radio-button value="list">
+            <el-icon><List /></el-icon> 列表
+          </el-radio-button>
+          <el-radio-button value="card">
+            <el-icon><Grid /></el-icon> 卡片
+          </el-radio-button>
+        </el-radio-group>
+        <span class="view-bar-hint">
+          <template v-if="viewMode === 'card'">
+            卡片视图同样支持勾选、批量操作与翻页
+          </template>
+        </span>
+      </div>
+
+      <div v-if="viewMode === 'list'" class="table-wrapper">
       <el-table
         ref="tableRef"
         :data="testcases"
@@ -305,7 +323,117 @@
         </el-table-column>
       </el-table>
       </div>
-      
+
+      <!-- 卡片视图：一条用例一张卡，字段与列表一致 -->
+      <div v-if="viewMode === 'card'" class="card-grid" v-loading="loading">
+        <div v-if="!testcases.length && !loading" class="card-empty">暂无用例</div>
+        <div
+          v-for="(row, idx) in testcases"
+          :key="row.id"
+          class="case-card"
+          :class="{ 'is-selected': isCardSelected(row) }"
+        >
+          <div class="card-head">
+            <el-checkbox
+              :model-value="isCardSelected(row)"
+              @change="(v) => toggleCardSelect(row, v)"
+            />
+            <span class="card-index">#{{ getSerialNumber(idx) }}</span>
+            <el-link class="card-title" type="primary" @click="goToTestCase(row.id)">
+              {{ row.title }}
+            </el-link>
+            <el-tag v-if="row.steps && row.steps.includes('【步骤缺失')" size="small" type="danger">
+              步骤缺失
+            </el-tag>
+          </div>
+
+          <div class="card-tags">
+            <el-tag :class="`priority-tag ${row.priority}`" size="small">{{ getPriorityText(row.priority) }}</el-tag>
+            <el-tag :type="getStatusType(row.status)" size="small">{{ getStatusText(row.status) }}</el-tag>
+            <el-tag :type="getSourceType(row.source)" size="small">{{ getSourceText(row.source) }}</el-tag>
+            <el-tag v-if="row.latest_execution_result === 'pass'" type="success" size="small">✅ 通过</el-tag>
+            <el-tag v-else-if="row.latest_execution_result === 'fail'" type="danger" size="small">❌ 失败</el-tag>
+            <span v-else class="card-muted">未执行</span>
+            <span v-if="row.test_type" class="card-type">{{ getTypeText(row.test_type) }}</span>
+          </div>
+
+          <div class="card-meta">
+            <span class="card-field">
+              <b>项目</b>
+              <em>{{ row.project?.name || '-' }}</em>
+            </span>
+            <span class="card-field">
+              <b>版本</b>
+              <em>
+                <template v-if="row.versions && row.versions.length">
+                  <el-tag
+                    v-for="v in row.versions.slice(0, 2)"
+                    :key="v.id"
+                    size="small"
+                    :type="v.is_baseline ? 'warning' : 'info'"
+                    class="mini-tag"
+                  >{{ v.name }}</el-tag>
+                  <el-tooltip v-if="row.versions.length > 2" :content="getVersionsTooltip(row.versions)">
+                    <el-tag size="small" type="info" class="mini-tag">+{{ row.versions.length - 2 }}</el-tag>
+                  </el-tooltip>
+                </template>
+                <span v-else class="card-muted">未关联版本</span>
+              </em>
+            </span>
+            <span class="card-field">
+              <b>模块</b>
+              <em>
+                <template v-if="row.feature_modules && row.feature_modules.length">
+                  <el-tag
+                    v-for="fm in row.feature_modules.slice(0, 2)"
+                    :key="fm.id"
+                    size="small"
+                    type="success"
+                    class="mini-tag"
+                  >{{ fm.name }}</el-tag>
+                  <el-tooltip v-if="row.feature_modules.length > 2" :content="getFeatureModulesTooltip(row.feature_modules)">
+                    <el-tag size="small" type="success" class="mini-tag">+{{ row.feature_modules.length - 2 }}</el-tag>
+                  </el-tooltip>
+                </template>
+                <span v-else class="card-muted">-</span>
+              </em>
+            </span>
+            <span class="card-field">
+              <b>测试点</b>
+              <em>
+                <el-tag v-if="row.test_point && row.test_point.name" size="small" type="warning" class="mini-tag">
+                  {{ row.test_point.name }}
+                </el-tag>
+                <span v-else class="card-muted">-</span>
+              </em>
+            </span>
+          </div>
+
+          <div class="card-foot">
+            <span class="card-sub">
+              {{ row.author?.username || '-' }} · {{ formatDate(row.created_at) }}
+            </span>
+            <div class="card-actions">
+              <el-button size="small" type="success" @click="openExecuteDialog(row)">执行</el-button>
+              <el-button size="small" @click="editTestCase(row)">编辑</el-button>
+              <el-button size="small" type="danger" @click="deleteTestCase(row)">删除</el-button>
+              <el-button
+                size="small"
+                type="primary"
+                title="将这条用例转为UI自动化结构化用例"
+                @click="openConvertDialog([row], 'ui')"
+              >🚀 转UI</el-button>
+              <el-button
+                size="small"
+                type="success"
+                title="转为UI自动化结构化用例（Appium App自动化），需回填元素定位器"
+                @click="openConvertDialog([row], 'appium')"
+              >📱 转Appium</el-button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="pagination-container">
         <el-pagination
           v-model:current-page="currentPage"
@@ -462,10 +590,10 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, nextTick, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Search, Download, Delete, RefreshLeft, Select, Promotion, Upload } from '@element-plus/icons-vue'
+import { Plus, Search, Download, Delete, RefreshLeft, Select, Promotion, Upload, List, Grid } from '@element-plus/icons-vue'
 import api from '@/utils/api'
 import dayjs from 'dayjs'
 import * as XLSX from 'xlsx'
@@ -504,6 +632,21 @@ const selectedTestCases = ref([])
 const isDeleting = ref(false)
 const isSelectingAll = ref(false)  // 正在全选筛选结果（分页拉取中）
 const selectAllMode = ref(false)  // 全选模式：true=已全选当前筛选条件下的全部数据
+
+// 展示方式：list=表格 / card=卡片。持久化到 localStorage，刷新后保持上次选择。
+const VIEW_MODE_KEY = 'testhub:testcase:view-mode'
+const viewMode = ref(localStorage.getItem(VIEW_MODE_KEY) === 'card' ? 'card' : 'list')
+watch(viewMode, async (val) => {
+  localStorage.setItem(VIEW_MODE_KEY, val)
+  if (val !== 'list') return
+  // 从卡片切回表格：el-table 的勾选状态由内部维护，卡片里改动的选择需要回灌，
+  // 否则会出现「卡片选了 3 条，切回表格全没勾」。
+  await nextTick()
+  const picked = new Set(selectedTestCases.value.map(c => c.id))
+  testcases.value.forEach(row => {
+    tableRef.value?.toggleRowSelection(row, selectAllMode.value || picked.has(row.id))
+  })
+})
 
 // 快速创建功能模块
 const showQuickCreateFeatureModule = ref(false)
@@ -927,6 +1070,28 @@ const deleteTestCase = async (testcase) => {
       ElMessage.error('测试用例删除失败')
     }
   }
+}
+
+// 卡片视图的选中判定：全选模式下当前页视为全部选中（与表格行为一致）
+const isCardSelected = (row) => {
+  if (selectAllMode.value) return true
+  return selectedTestCases.value.some(c => c.id === row.id)
+}
+
+// 卡片视图勾选 / 取消勾选（与 selectedTestCases 保持同一份状态）
+const toggleCardSelect = (row, checked) => {
+  if (selectAllMode.value) {
+    if (checked) return
+    // 全选模式下取消某一条 → 退出全选，回退为「当前页除该条外全部选中」，与表格语义一致
+    selectAllMode.value = false
+    selectedTestCases.value = testcases.value.filter(r => r.id !== row.id)
+    return
+  }
+  const list = selectedTestCases.value.slice()
+  const idx = list.findIndex(c => c.id === row.id)
+  if (checked && idx === -1) list.push(row)
+  if (!checked && idx >= 0) list.splice(idx, 1)
+  selectedTestCases.value = list
 }
 
 // 处理选择变化
@@ -1595,6 +1760,145 @@ onMounted(async () => {
 .table-wrapper {
   width: 100%;
   overflow-x: auto;
+}
+
+/* ---------- 展示方式切换 ---------- */
+.view-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.view-bar-label {
+  font-size: 13px;
+  color: #909399;
+}
+.view-bar-hint {
+  font-size: 12px;
+  color: #b1b3b8;
+}
+
+/* ---------- 卡片视图 ---------- */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(520px, 1fr));
+  gap: 14px;
+  min-height: 60px;
+}
+.card-empty {
+  padding: 40px 0;
+  text-align: center;
+  color: #909399;
+  font-size: 13px;
+}
+.case-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px 12px;
+  background: #fff;
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.case-card:hover {
+  border-color: #c6e2ff;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+}
+.case-card.is-selected {
+  border-color: #409eff;
+  box-shadow: 0 0 0 1px #409eff inset;
+}
+
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.card-index {
+  flex: none;
+  margin-top: 1px;
+  font-size: 12px;
+  color: #909399;
+  font-variant-numeric: tabular-nums;
+}
+.card-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.card-type {
+  font-size: 12px;
+  color: #909399;
+}
+.card-muted {
+  font-size: 12px;
+  color: #b1b3b8;
+}
+
+.card-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 16px;
+  padding-top: 2px;
+}
+.card-field {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.card-field b {
+  flex: none;
+  width: 40px;
+  color: #909399;
+  font-weight: 400;
+}
+.card-field em {
+  min-width: 0;
+  color: #303133;
+  font-style: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.card-field .mini-tag {
+  margin-right: 4px;
+}
+
+.card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px dashed #ebeef5;
+}
+.card-sub {
+  font-size: 12px;
+  color: #909399;
+}
+.card-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.card-actions .el-button {
+  margin-left: 0;
 }
 
 .filter-bar {
