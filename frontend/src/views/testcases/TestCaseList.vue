@@ -1797,9 +1797,10 @@ onMounted(async () => {
 /* ---------- 卡片视图 ---------- */
 .card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(560px, 1fr));
+  /* 一行一条用例：卡片铺满整行，步骤与预期不再被窄列挤压换行 */
+  grid-template-columns: 1fr;
   align-items: start;
-  gap: 14px;
+  gap: 12px;
   min-height: 60px;
 }
 .card-empty {
@@ -1941,9 +1942,15 @@ onMounted(async () => {
 
 .card-meta {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* 单列宽卡：四个字段排一行，窄屏回落到两列 */
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px 16px;
   padding-top: 2px;
+}
+@media (max-width: 1100px) {
+  .card-meta {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 .card-field {
   display: flex;
