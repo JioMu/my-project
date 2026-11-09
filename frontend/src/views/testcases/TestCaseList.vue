@@ -357,6 +357,22 @@
             <span v-if="row.test_type" class="card-type">{{ getTypeText(row.test_type) }}</span>
           </div>
 
+          <!-- 用例正文：前置条件 / 操作步骤 / 预期结果（与详情页同样按富文本渲染） -->
+          <div class="card-body">
+            <div v-if="row.preconditions" class="card-block">
+              <div class="block-label">前置条件</div>
+              <div class="block-text" v-html="row.preconditions"></div>
+            </div>
+            <div class="card-block">
+              <div class="block-label">操作步骤</div>
+              <div class="block-text" v-html="row.steps || '无'"></div>
+            </div>
+            <div class="card-block">
+              <div class="block-label">预期结果</div>
+              <div class="block-text" v-html="row.expected_result || '无'"></div>
+            </div>
+          </div>
+
           <div class="card-meta">
             <span class="card-field">
               <b>项目</b>
@@ -1781,7 +1797,8 @@ onMounted(async () => {
 /* ---------- 卡片视图 ---------- */
 .card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(520px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(560px, 1fr));
+  align-items: start;
   gap: 14px;
   min-height: 60px;
 }
@@ -1837,6 +1854,81 @@ onMounted(async () => {
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
+}
+
+/* 用例正文：前置条件 / 操作步骤 / 预期结果 */
+.card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  background: #fafbfc;
+  border: 1px solid #f0f2f5;
+  border-radius: 6px;
+}
+.card-body::-webkit-scrollbar {
+  width: 6px;
+}
+.card-body::-webkit-scrollbar-thumb {
+  background: #dcdfe6;
+  border-radius: 3px;
+}
+.card-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.block-label {
+  flex: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: #606266;
+}
+.block-label::before {
+  content: '';
+  display: inline-block;
+  width: 3px;
+  height: 11px;
+  margin-right: 6px;
+  vertical-align: -1px;
+  background: #409eff;
+  border-radius: 2px;
+}
+.block-text {
+  font-size: 12px;
+  line-height: 1.75;
+  color: #303133;
+  word-break: break-word;
+  /* 实测 steps/expected_result 是「1. xxx\n2. xxx」纯文本，不是 HTML；
+     不加 pre-wrap 会被折叠成一行。富文本紧凑 HTML 下 pre-wrap 也不影响渲染。 */
+  white-space: pre-wrap;
+}
+/* v-html 内容不受 scoped 约束，需 deep 才能收紧默认段落间距 */
+.card-body :deep(.block-text p) {
+  margin: 0 0 4px;
+}
+.card-body :deep(.block-text p:last-child) {
+  margin-bottom: 0;
+}
+.card-body :deep(.block-text ol),
+.card-body :deep(.block-text ul) {
+  margin: 2px 0;
+  padding-left: 20px;
+}
+.card-body :deep(.block-text li) {
+  margin-bottom: 2px;
+}
+.card-body :deep(.block-text table) {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.card-body :deep(.block-text th),
+.card-body :deep(.block-text td) {
+  border: 1px solid #ebeef5;
+  padding: 3px 6px;
 }
 .card-type {
   font-size: 12px;
