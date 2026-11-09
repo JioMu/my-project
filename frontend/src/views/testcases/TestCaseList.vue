@@ -357,19 +357,46 @@
             <span v-if="row.test_type" class="card-type">{{ getTypeText(row.test_type) }}</span>
           </div>
 
-          <!-- 用例正文：左前置条件 / 中操作步骤 / 右预期结果，横向三栏铺满宽度 -->
+          <!-- 用例正文：左前置条件 / 中操作步骤 / 右预期结果，逐条拆分渲染 -->
           <div class="card-body">
             <div class="card-block">
-              <div class="block-label">前置条件</div>
-              <div class="block-text" v-html="row.preconditions || '无'"></div>
+              <div class="block-label">
+                前置条件
+                <span v-if="cardBlocks[row.id].pre.lines.length" class="block-count">
+                  {{ cardBlocks[row.id].pre.lines.length }}
+                </span>
+              </div>
+              <div v-if="cardBlocks[row.id].pre.rich" class="block-text" v-html="row.preconditions"></div>
+              <ol v-else-if="cardBlocks[row.id].pre.lines.length" class="block-list">
+                <li v-for="(line, i) in cardBlocks[row.id].pre.lines" :key="i">{{ line }}</li>
+              </ol>
+              <div v-else class="block-text block-empty">无</div>
             </div>
             <div class="card-block block-main">
-              <div class="block-label">操作步骤</div>
-              <div class="block-text" v-html="row.steps || '无'"></div>
+              <div class="block-label">
+                操作步骤
+                <span v-if="cardBlocks[row.id].steps.lines.length" class="block-count">
+                  {{ cardBlocks[row.id].steps.lines.length }}
+                </span>
+              </div>
+              <div v-if="cardBlocks[row.id].steps.rich" class="block-text" v-html="row.steps"></div>
+              <ol v-else-if="cardBlocks[row.id].steps.lines.length" class="block-list">
+                <li v-for="(line, i) in cardBlocks[row.id].steps.lines" :key="i">{{ line }}</li>
+              </ol>
+              <div v-else class="block-text block-empty">无</div>
             </div>
             <div class="card-block">
-              <div class="block-label">预期结果</div>
-              <div class="block-text" v-html="row.expected_result || '无'"></div>
+              <div class="block-label">
+                预期结果
+                <span v-if="cardBlocks[row.id].expected.lines.length" class="block-count">
+                  {{ cardBlocks[row.id].expected.lines.length }}
+                </span>
+              </div>
+              <div v-if="cardBlocks[row.id].expected.rich" class="block-text" v-html="row.expected_result"></div>
+              <ol v-else-if="cardBlocks[row.id].expected.lines.length" class="block-list">
+                <li v-for="(line, i) in cardBlocks[row.id].expected.lines" :key="i">{{ line }}</li>
+              </ol>
+              <div v-else class="block-text block-empty">无</div>
             </div>
           </div>
 
@@ -1087,6 +1114,38 @@ const deleteTestCase = async (testcase) => {
     }
   }
 }
+
+// ---------- 卡片正文结构化 ----------
+// 实测 steps/expected_result 是「1. xxx\n2. xxx」纯文本，直接铺成一段很难一眼读。
+// 这里把它拆成条目：去掉行首自带编号（用 ol 统一重新编号），逐条渲染成带序号的短行。
+// 老数据若本身是富文本（含 <p>/<ul>/<br> 等标签），保留整块 v-html，避免把标签当文字显示。
+const _RICH_TEXT_RE = /<(p|div|br|ul|ol|li|table|tr|td|th|span|strong|em|b|i)\b/i
+
+const buildBlock = (text) => {
+  const raw = String(text == null ? '' : text).trim()
+  if (!raw) return { rich: false, lines: [] }
+  if (_RICH_TEXT_RE.test(raw)) return { rich: true, lines: [] }
+  const lines = raw
+    .split(/\r?\n/)
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(s => s.replace(/^(?:\d+\s*[.、)]|[-*•·])\s*/, '').trim())
+    .filter(Boolean)
+  return { rich: false, lines }
+}
+
+// 每页 20 条，一次性算好，避免模板里对同一字段重复拆分
+const cardBlocks = computed(() => {
+  const map = {}
+  for (const row of testcases.value) {
+    map[row.id] = {
+      pre: buildBlock(row.preconditions),
+      steps: buildBlock(row.steps),
+      expected: buildBlock(row.expected_result),
+    }
+  }
+  return map
+})
 
 // 卡片视图的选中判定：全选模式下当前页视为全部选中（与表格行为一致）
 const isCardSelected = (row) => {
@@ -1872,7 +1931,7 @@ onMounted(async () => {
   flex-direction: column;
   gap: 4px;
   min-width: 0;
-  max-height: 300px;
+  max-height: 240px;
   overflow-y: auto;
   padding: 10px 14px;
 }
@@ -1888,10 +1947,13 @@ onMounted(async () => {
 }
 /* 步骤栏最宽，视觉重心在这里 */
 .block-main .block-label::before {
-  background: #67c23a;
+  background: #409eff;
 }
 .block-label {
+  display: flex;
+  align-items: center;
   flex: none;
+  margin-bottom: 2px;
   font-size: 12px;
   font-weight: 600;
   color: #606266;
@@ -1903,17 +1965,70 @@ onMounted(async () => {
   height: 11px;
   margin-right: 6px;
   vertical-align: -1px;
-  background: #409eff;
+  background: #c0c4cc;
   border-radius: 2px;
+}
+.block-count {
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 16px;
+  color: #909399;
+  background: #f0f2f5;
+  border-radius: 8px;
 }
 .block-text {
   font-size: 12px;
-  line-height: 1.75;
+  line-height: 1.7;
   color: #303133;
   word-break: break-word;
-  /* 实测 steps/expected_result 是「1. xxx\n2. xxx」纯文本，不是 HTML；
-     不加 pre-wrap 会被折叠成一行。富文本紧凑 HTML 下 pre-wrap 也不影响渲染。 */
-  white-space: pre-wrap;
+}
+.block-empty {
+  color: #c0c4cc;
+}
+/* 逐条列表：序号用小圆标，条目之间留白，比整段文字好扫读 */
+.block-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: block-item;
+}
+.block-list li {
+  position: relative;
+  padding-left: 21px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #303133;
+  word-break: break-word;
+}
+.block-list li:last-child {
+  margin-bottom: 0;
+}
+.block-list li::before {
+  counter-increment: block-item;
+  content: counter(block-item);
+  position: absolute;
+  left: 0;
+  top: 2px;
+  width: 15px;
+  height: 15px;
+  font-size: 10px;
+  line-height: 15px;
+  text-align: center;
+  color: #909399;
+  background: #f0f2f5;
+  border-radius: 50%;
+}
+/* 步骤用蓝底，预期用绿底，前置灰底，扫读时先抓步骤和预期 */
+.block-main .block-list li::before {
+  color: #409eff;
+  background: #ecf5ff;
+}
+.card-block:nth-child(3) .block-list li::before {
+  color: #67c23a;
+  background: #f0f9eb;
 }
 /* 窄屏回落为纵向堆叠，避免三栏被压得过窄 */
 @media (max-width: 1200px) {
