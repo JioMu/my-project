@@ -258,6 +258,8 @@ export default {
       caseFilter: 'all',
       caseGroups: '',
       pollTimer: null,
+      // 轮询世代号：stopPoll 递增后，任何在途 tick 都不会再排下一次
+      pollGen: 0,
       folderFilter: '',
       // 待写回服务端的勾选变更 {pageId: bool}；合并成一次请求。
       // 同时用于 loadDetail 时"不被轮询覆盖"，见 loadDetail 里的注释。
@@ -760,10 +762,34 @@ export default {
     },
     startPoll() {
       this.stopPoll()
-      this.pollTimer = setInterval(() => this.loadDetail(), 3000)
+      // ⚠️ 2026-11-05（生产事故：MySQL 连接被打满 → 全站 500）：
+      // 轮询只在 isRunning 时启用，但 loadDetail() 在 _fullLoaded=true 后会拉**全量**
+      // 详情（含逐页用例产物 + 后端 _adopted_entry_keys 全量判重）。
+      // 一旦单次请求耗时接近或超过 3 秒，请求就会不断堆积、连接只增不减
+      // （实测 152/151，Sleep 150 条但 time>60 仅 1 条 = 高频短命连接）。
+      // 改为「上一次请求完成后再排下一次」，避免并发叠加。
+      // ⚠️ 必须用世代号（pollGen）：stopPoll 无法取消已 await 中的请求，
+      // 组件卸载后 tick 恢复执行时若仍无条件 setTimeout，会重新把轮询挂起来
+      // （定时器泄漏 + 卸载后继续打接口）。世代号让旧 tick 直接作废。
+      const gen = ++this.pollGen
+      const tick = async () => {
+        if (gen !== this.pollGen || !this.isRunning) return
+        try {
+          await this.loadDetail()
+        } catch (e) {
+          // loadDetail 内部已提示，这里只保证轮询不中断
+        }
+        if (gen !== this.pollGen || !this.isRunning) return
+        this.pollTimer = setTimeout(tick, 3000)
+      }
+      this.pollTimer = setTimeout(tick, 3000)
     },
     stopPoll() {
+      // 递增世代号，使任何在途 tick 的后续 setTimeout 失效
+      this.pollGen = (this.pollGen || 0) + 1
       if (this.pollTimer) {
+        // startPoll 用的是 setTimeout 链式（避免请求叠加），必须用 clearTimeout
+        clearTimeout(this.pollTimer)
         clearInterval(this.pollTimer)
         this.pollTimer = null
       }

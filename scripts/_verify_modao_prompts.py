@@ -55,11 +55,14 @@ def md5_bin(path):
 # ⚠️ 每次改动提示词后必须同步更新本表，否则 STEP5/STEP6 会 MISMATCH（非真故障）。
 # 2026-10-14 更新：p2/p3 补「兜底句先改写 + 覆盖不回退 + 硬约束6例外」；
 #                  p7 补「pass_criteria 原样继承」（修根因：判据在合并阶段被静默丢弃）。
+# 2026-11-05 更新：p0 补硬约束 29/30/31（模块=主画布+多状态 / 状态差异各自成 key_features
+#                  / 画布边界不可越界）；p2 补 feature_ref、api_ref 强制字段；
+#                  p7 补 ref 并集透传 + category 保真（commit 0ae6a19）。
 EXPECT = {
-    'p0_requirement_struct': '63CD0947D95E4831C247418C520C0708',
-    'p2_testpoint_gen': '2A183D64FEE02FE01ECB6C3C3A877759',
+    'p0_requirement_struct': '809B3460D76C2197CC32A6A91F1BABA4',
+    'p2_testpoint_gen': 'B042C48309C0BA93DAB731A0EC097F53',
     'p3_case_gen': '6596C958C826F7003F7003197AB8B428',
-    'p7_merge_dedup': 'AF4D46C137E031D8EB6B6EB063E7A438',
+    'p7_merge_dedup': '9EB29E57F4E624BE029EECC35ADBB9C1',
 }
 
 # 锚点串：取自提示词文件真实文本（⚠️ 不要凭印象写，曾误报过 MISSING）

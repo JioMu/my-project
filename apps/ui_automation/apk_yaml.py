@@ -114,6 +114,27 @@ _LAUNCH_STEP = re.compile(
 #: 与「进入个人中心」被丢弃是同一类错误，只是丢的是动作而不是结果。
 _COMPOSITE_CHAIN = re.compile(r'(?:然后|随后|接着|之后再|再点击|再点)')
 
+#: 「先展开/唤出，再在其中选择」的两段式动作。
+#:
+#: 为什么单独判（2026-11-03 实测，run 步骤 11「点击任意一个心情图标」）：
+#:   日记页的心情区域初始是**收起**的，必须先点开才有一排心情图标可选。
+#:   句子被 `^点击` 规则判成 aiTap 后，`_tap_target` 抽出的是「任意一个心情图标」，
+#:   ai_tap 拿着这句描述在收起态页面上总得找到点东西点下去（往往是容器或
+#:   「记录心情」文字），点完页面确实有细微变化 ⇒ `_verify_tap_effect` 判生效，
+#:   报告显示 passed，而心情根本没被选中。
+#:   ⇒ 只要一句话里包含"展开/唤出/点开…再选"这种**两段式**语义，
+#:     就必须整句交给 aiAct，让模型先展开、看到候选、再从中挑一个。
+_EXPAND_THEN_PICK = re.compile(
+    r'(?:展开|展开面板|点开|打开面板|唤出|呼出|调出|划出|弹出)'
+    r'[\s\S]{0,12}?(?:后|之?后再|然后|并|[，,；;])'
+    r'[\s\S]{0,12}?(?:选择|选中|点选|挑|点一个|点其中|点击其中|选一个)'
+    # 不带"展开"字样、但语义就是"在已出现的候选里挑一个"的写法：
+    # 「点击任意一个心情图标（需先展开心情面板）」/「在展开的心情区域里选一个」
+    r'|(?:展开的|已展开|弹出|出现的)[\s\S]{0,10}?'
+    r'(?:图标|表情|选项|面板|区域)[\s\S]{0,10}?(?:中|里)?[\s\S]{0,6}?'
+    r'(?:选|点|挑)')
+
+
 
 #: 「条件句」判据：动作是否发生取决于当前界面状态。
 #:
@@ -140,6 +161,15 @@ def is_composite_step(text):
     return bool(_COMPOSITE_RESULT.search(t) or _COMPOSITE_CHAIN.search(t))
 
 
+def is_expand_then_pick_step(text):
+    """是否为「先展开再选择」的两段式动作，必须走 aiAct。
+
+    见 `_EXPAND_THEN_PICK` 的说明：这类句子前半句（展开）是一定要做的动作，
+    后半句（在候选中选一个）是真正目标。拆成 aiTap 会只做前半句或点错元素。
+    """
+    return bool(_EXPAND_THEN_PICK.search(str(text or '')))
+
+
 def classify_step(text):
     """根据步骤文本判断该用哪个 action。
 
@@ -158,6 +188,11 @@ def classify_step(text):
     # 强行 aiTap 只会抛 failed to locate element。
     if is_conditional_step(t):
         return 'aiAct', '条件句（是否执行取决于界面状态）'
+    # ⚠️ 「展开→选择」两段式同样优先于 `^点击`：
+    # 「点击任意一个心情图标」在收起态页面没有可点的目标，
+    # aiTap 会去点容器并误判成功（2026-11-03 实测）。
+    if is_expand_then_pick_step(t):
+        return 'aiAct', '需先展开再选择的两段式动作'
     for action, pattern, label in _STEP_INTENT_RULES:
         if pattern.search(t):
             return action, label

@@ -176,7 +176,25 @@
         </div>
       </div>
       
-      <div class="table-wrapper">
+      <!-- 展示方式切换：列表 / 卡片（选择状态两者互通） -->
+      <div class="view-bar">
+        <span class="view-bar-label">展示方式</span>
+        <el-radio-group v-model="viewMode" size="small">
+          <el-radio-button value="list">
+            <el-icon><List /></el-icon> 列表
+          </el-radio-button>
+          <el-radio-button value="card">
+            <el-icon><Grid /></el-icon> 卡片
+          </el-radio-button>
+        </el-radio-group>
+        <span class="view-bar-hint">
+          <template v-if="viewMode === 'card'">
+            卡片视图同样支持勾选、批量操作与翻页
+          </template>
+        </span>
+      </div>
+
+      <div v-if="viewMode === 'list'" class="table-wrapper">
       <el-table
         ref="tableRef"
         :data="testcases"
@@ -305,7 +323,174 @@
         </el-table-column>
       </el-table>
       </div>
-      
+
+      <!-- 卡片视图：一条用例一张卡，字段与列表一致 -->
+      <div v-if="viewMode === 'card'" class="card-grid" v-loading="loading">
+        <div v-if="!testcases.length && !loading" class="card-empty">暂无用例</div>
+        <div
+          v-for="(row, idx) in testcases"
+          :key="row.id"
+          class="case-card"
+          :class="{ 'is-selected': isCardSelected(row) }"
+        >
+          <div class="card-head">
+            <div class="head-main">
+              <el-checkbox
+                class="head-check"
+                :model-value="isCardSelected(row)"
+                @change="(v) => toggleCardSelect(row, v)"
+              />
+              <div class="head-text">
+                <div class="title-row">
+                  <el-link class="card-title" type="primary" @click="goToTestCase(row.id)">
+                    {{ row.title }}
+                  </el-link>
+                  <el-tag v-if="row.steps && row.steps.includes('【步骤缺失')" size="small" type="danger">
+                    步骤缺失
+                  </el-tag>
+                </div>
+                <div class="card-subline">
+                  <span class="subline-no">#{{ getSerialNumber(idx) }}</span>
+                  <span v-if="row.project?.name" class="subline-dot">·</span>
+                  <span v-if="row.project?.name">{{ row.project.name }}</span>
+                  <template v-if="row.test_point?.name">
+                    <span class="subline-dot">·</span>
+                    <span>{{ row.test_point.name }}</span>
+                  </template>
+                </div>
+              </div>
+            </div>
+            <div class="card-tags">
+              <el-tag :class="`priority-tag ${row.priority}`" size="small">{{ getPriorityText(row.priority) }}</el-tag>
+              <el-tag :type="getStatusType(row.status)" size="small">{{ getStatusText(row.status) }}</el-tag>
+              <el-tag :type="getSourceType(row.source)" size="small">{{ getSourceText(row.source) }}</el-tag>
+              <el-tag v-if="row.latest_execution_result === 'pass'" type="success" size="small">✅ 通过</el-tag>
+              <el-tag v-else-if="row.latest_execution_result === 'fail'" type="danger" size="small">❌ 失败</el-tag>
+              <span v-else class="card-muted">未执行</span>
+              <span v-if="row.test_type" class="card-type">{{ getTypeText(row.test_type) }}</span>
+            </div>
+          </div>
+
+          <!-- 用例正文：左前置条件 / 中操作步骤 / 右预期结果，逐条拆分渲染 -->
+          <div class="card-body">
+            <div class="card-block">
+              <div class="block-label">
+                前置条件
+                <span v-if="cardBlocks[row.id].pre.lines.length" class="block-count">
+                  {{ cardBlocks[row.id].pre.lines.length }}
+                </span>
+              </div>
+              <div v-if="cardBlocks[row.id].pre.rich" class="block-text" v-html="row.preconditions"></div>
+              <ol v-else-if="cardBlocks[row.id].pre.lines.length" class="block-list">
+                <li v-for="(line, i) in cardBlocks[row.id].pre.lines" :key="i">{{ line }}</li>
+              </ol>
+              <div v-else class="block-text block-empty">无</div>
+            </div>
+            <div class="card-block block-main">
+              <div class="block-label">
+                操作步骤
+                <span v-if="cardBlocks[row.id].steps.lines.length" class="block-count">
+                  {{ cardBlocks[row.id].steps.lines.length }}
+                </span>
+              </div>
+              <div v-if="cardBlocks[row.id].steps.rich" class="block-text" v-html="row.steps"></div>
+              <ol v-else-if="cardBlocks[row.id].steps.lines.length" class="block-list">
+                <li v-for="(line, i) in cardBlocks[row.id].steps.lines" :key="i">{{ line }}</li>
+              </ol>
+              <div v-else class="block-text block-empty">无</div>
+            </div>
+            <div class="card-block">
+              <div class="block-label">
+                预期结果
+                <span v-if="cardBlocks[row.id].expected.lines.length" class="block-count">
+                  {{ cardBlocks[row.id].expected.lines.length }}
+                </span>
+              </div>
+              <div v-if="cardBlocks[row.id].expected.rich" class="block-text" v-html="row.expected_result"></div>
+              <ol v-else-if="cardBlocks[row.id].expected.lines.length" class="block-list">
+                <li v-for="(line, i) in cardBlocks[row.id].expected.lines" :key="i">{{ line }}</li>
+              </ol>
+              <div v-else class="block-text block-empty">无</div>
+            </div>
+          </div>
+
+          <div class="card-meta">
+            <span class="card-field">
+              <b>项目</b>
+              <em>{{ row.project?.name || '-' }}</em>
+            </span>
+            <span class="card-field">
+              <b>版本</b>
+              <em>
+                <template v-if="row.versions && row.versions.length">
+                  <el-tag
+                    v-for="v in row.versions.slice(0, 2)"
+                    :key="v.id"
+                    size="small"
+                    :type="v.is_baseline ? 'warning' : 'info'"
+                    class="mini-tag"
+                  >{{ v.name }}</el-tag>
+                  <el-tooltip v-if="row.versions.length > 2" :content="getVersionsTooltip(row.versions)">
+                    <el-tag size="small" type="info" class="mini-tag">+{{ row.versions.length - 2 }}</el-tag>
+                  </el-tooltip>
+                </template>
+                <span v-else class="card-muted">未关联版本</span>
+              </em>
+            </span>
+            <span class="card-field">
+              <b>模块</b>
+              <em>
+                <template v-if="row.feature_modules && row.feature_modules.length">
+                  <el-tag
+                    v-for="fm in row.feature_modules.slice(0, 2)"
+                    :key="fm.id"
+                    size="small"
+                    type="success"
+                    class="mini-tag"
+                  >{{ fm.name }}</el-tag>
+                  <el-tooltip v-if="row.feature_modules.length > 2" :content="getFeatureModulesTooltip(row.feature_modules)">
+                    <el-tag size="small" type="success" class="mini-tag">+{{ row.feature_modules.length - 2 }}</el-tag>
+                  </el-tooltip>
+                </template>
+                <span v-else class="card-muted">-</span>
+              </em>
+            </span>
+            <span class="card-field">
+              <b>测试点</b>
+              <em>
+                <el-tag v-if="row.test_point && row.test_point.name" size="small" type="warning" class="mini-tag">
+                  {{ row.test_point.name }}
+                </el-tag>
+                <span v-else class="card-muted">-</span>
+              </em>
+            </span>
+          </div>
+
+          <div class="card-foot">
+            <span class="card-sub">
+              {{ row.author?.username || '-' }} · {{ formatDate(row.created_at) }}
+            </span>
+            <div class="card-actions">
+              <el-button size="small" type="success" @click="openExecuteDialog(row)">执行</el-button>
+              <el-button size="small" @click="editTestCase(row)">编辑</el-button>
+              <el-button size="small" type="danger" @click="deleteTestCase(row)">删除</el-button>
+              <el-button
+                size="small"
+                type="primary"
+                title="将这条用例转为UI自动化结构化用例"
+                @click="openConvertDialog([row], 'ui')"
+              >🚀 转UI</el-button>
+              <el-button
+                size="small"
+                type="success"
+                title="转为UI自动化结构化用例（Appium App自动化），需回填元素定位器"
+                @click="openConvertDialog([row], 'appium')"
+              >📱 转Appium</el-button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="pagination-container">
         <el-pagination
           v-model:current-page="currentPage"
@@ -462,10 +647,10 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, nextTick, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Search, Download, Delete, RefreshLeft, Select, Promotion, Upload } from '@element-plus/icons-vue'
+import { Plus, Search, Download, Delete, RefreshLeft, Select, Promotion, Upload, List, Grid } from '@element-plus/icons-vue'
 import api from '@/utils/api'
 import dayjs from 'dayjs'
 import * as XLSX from 'xlsx'
@@ -504,6 +689,21 @@ const selectedTestCases = ref([])
 const isDeleting = ref(false)
 const isSelectingAll = ref(false)  // 正在全选筛选结果（分页拉取中）
 const selectAllMode = ref(false)  // 全选模式：true=已全选当前筛选条件下的全部数据
+
+// 展示方式：list=表格 / card=卡片。持久化到 localStorage，刷新后保持上次选择。
+const VIEW_MODE_KEY = 'testhub:testcase:view-mode'
+const viewMode = ref(localStorage.getItem(VIEW_MODE_KEY) === 'card' ? 'card' : 'list')
+watch(viewMode, async (val) => {
+  localStorage.setItem(VIEW_MODE_KEY, val)
+  if (val !== 'list') return
+  // 从卡片切回表格：el-table 的勾选状态由内部维护，卡片里改动的选择需要回灌，
+  // 否则会出现「卡片选了 3 条，切回表格全没勾」。
+  await nextTick()
+  const picked = new Set(selectedTestCases.value.map(c => c.id))
+  testcases.value.forEach(row => {
+    tableRef.value?.toggleRowSelection(row, selectAllMode.value || picked.has(row.id))
+  })
+})
 
 // 快速创建功能模块
 const showQuickCreateFeatureModule = ref(false)
@@ -927,6 +1127,60 @@ const deleteTestCase = async (testcase) => {
       ElMessage.error('测试用例删除失败')
     }
   }
+}
+
+// ---------- 卡片正文结构化 ----------
+// 实测 steps/expected_result 是「1. xxx\n2. xxx」纯文本，直接铺成一段很难一眼读。
+// 这里把它拆成条目：去掉行首自带编号（用 ol 统一重新编号），逐条渲染成带序号的短行。
+// 老数据若本身是富文本（含 <p>/<ul>/<br> 等标签），保留整块 v-html，避免把标签当文字显示。
+const _RICH_TEXT_RE = /<(p|div|br|ul|ol|li|table|tr|td|th|span|strong|em|b|i)\b/i
+
+const buildBlock = (text) => {
+  const raw = String(text == null ? '' : text).trim()
+  if (!raw) return { rich: false, lines: [] }
+  if (_RICH_TEXT_RE.test(raw)) return { rich: true, lines: [] }
+  const lines = raw
+    .split(/\r?\n/)
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(s => s.replace(/^(?:\d+\s*[.、)]|[-*•·])\s*/, '').trim())
+    .filter(Boolean)
+  return { rich: false, lines }
+}
+
+// 每页 20 条，一次性算好，避免模板里对同一字段重复拆分
+const cardBlocks = computed(() => {
+  const map = {}
+  for (const row of testcases.value) {
+    map[row.id] = {
+      pre: buildBlock(row.preconditions),
+      steps: buildBlock(row.steps),
+      expected: buildBlock(row.expected_result),
+    }
+  }
+  return map
+})
+
+// 卡片视图的选中判定：全选模式下当前页视为全部选中（与表格行为一致）
+const isCardSelected = (row) => {
+  if (selectAllMode.value) return true
+  return selectedTestCases.value.some(c => c.id === row.id)
+}
+
+// 卡片视图勾选 / 取消勾选（与 selectedTestCases 保持同一份状态）
+const toggleCardSelect = (row, checked) => {
+  if (selectAllMode.value) {
+    if (checked) return
+    // 全选模式下取消某一条 → 退出全选，回退为「当前页除该条外全部选中」，与表格语义一致
+    selectAllMode.value = false
+    selectedTestCases.value = testcases.value.filter(r => r.id !== row.id)
+    return
+  }
+  const list = selectedTestCases.value.slice()
+  const idx = list.findIndex(c => c.id === row.id)
+  if (checked && idx === -1) list.push(row)
+  if (!checked && idx >= 0) list.splice(idx, 1)
+  selectedTestCases.value = list
 }
 
 // 处理选择变化
@@ -1592,9 +1846,386 @@ onMounted(async () => {
 </script>
 
 <style lang="scss" scoped>
+/* 只作用于本页：统一中文字体栈 + 字形平滑，字号体系按 12/12.5/15 三档收敛 */
+.page-container {
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  color: #1f2329;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
 .table-wrapper {
   width: 100%;
   overflow-x: auto;
+}
+
+/* ---------- 展示方式切换 ---------- */
+.view-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.view-bar-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #646a73;
+}
+.view-bar-hint {
+  font-size: 12px;
+  color: #a8abb2;
+}
+.view-bar :deep(.el-radio-button__inner) {
+  padding: 6px 14px;
+  font-size: 13px;
+  border-radius: 6px;
+}
+.view-bar :deep(.el-radio-button:first-child .el-radio-button__inner) {
+  border-radius: 6px 0 0 6px;
+}
+.view-bar :deep(.el-radio-button:last-child .el-radio-button__inner) {
+  border-radius: 0 6px 6px 0;
+}
+
+/* ---------- 卡片视图 ---------- */
+.card-grid {
+  display: grid;
+  /* 一行一条用例：卡片铺满整行，步骤与预期不再被窄列挤压换行 */
+  grid-template-columns: 1fr;
+  align-items: start;
+  gap: 14px;
+  min-height: 60px;
+}
+.card-empty {
+  padding: 40px 0;
+  text-align: center;
+  color: #909399;
+  font-size: 13px;
+}
+.case-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px 22px 18px;
+  background: #fff;
+  border: 1px solid #eef0f4;
+  border-radius: 14px;
+  box-shadow: 0 1px 2px rgba(31, 35, 41, 0.04);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+}
+/* 左侧色条：选中时才点亮，平时不占视觉 */
+.case-card::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 16px;
+  bottom: 16px;
+  width: 3px;
+  background: transparent;
+  border-radius: 0 3px 3px 0;
+  transition: background 0.2s ease;
+}
+.case-card:hover {
+  border-color: #d9e6f7;
+  box-shadow: 0 4px 16px rgba(31, 35, 41, 0.08);
+  transform: translateY(-1px);
+}
+.case-card.is-selected {
+  border-color: #a3ccff;
+  background: #f7fbff;
+  box-shadow: 0 4px 16px rgba(64, 158, 255, 0.12);
+}
+.case-card.is-selected::before {
+  background: #409eff;
+}
+
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+.head-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+.head-check {
+  flex: none;
+  margin-top: 4px;
+  height: auto;
+}
+.head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.card-title {
+  min-width: 0;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: #1f2329;
+  word-break: break-word;
+  transition: color 0.2s ease;
+}
+.case-card:hover .card-title {
+  color: #2d7ff9;
+}
+.card-subline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #9298a0;
+}
+.subline-no {
+  font-variant-numeric: tabular-nums;
+}
+.subline-dot {
+  color: #d4d7dc;
+}
+
+.card-tags {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  max-width: 48%;
+}
+@media (max-width: 1100px) {
+  .card-head {
+    flex-direction: column;
+    gap: 12px;
+  }
+  .card-tags {
+    justify-content: flex-start;
+    max-width: 100%;
+  }
+}
+.card-tags :deep(.el-tag) {
+  height: 22px;
+  line-height: 20px;
+  padding: 0 8px;
+  font-size: 12px;
+  border-radius: 5px;
+}
+
+/* 用例正文：三栏横向铺满（前置条件 / 操作步骤 / 预期结果） */
+/* 三栏各自是独立浅色卡片，不是被分隔线切开的一整块 */
+.card-body {
+  display: grid;
+  grid-template-columns: 0.85fr 1.5fr 1fr;
+  align-items: stretch;
+  gap: 14px;
+}
+.card-block {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 12px;
+  background: #f8f9fc;
+  border-radius: 10px;
+}
+.card-block::-webkit-scrollbar {
+  width: 6px;
+}
+.card-block::-webkit-scrollbar-thumb {
+  background: #dcdfe6;
+  border-radius: 3px;
+}
+/* 栏标题做成浅蓝横条 + 左侧蓝条，与正文区拉开层次 */
+.block-label {
+  display: flex;
+  align-items: center;
+  flex: none;
+  padding: 9px 12px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: #1f2329;
+  background: linear-gradient(90deg, #e9f2ff 0%, #f3f8ff 76%, rgba(243, 248, 255, 0) 100%);
+  border-left: 3px solid #2d7ff9;
+  border-radius: 6px;
+}
+.block-count {
+  margin-left: 6px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 17px;
+  color: #5b8fd6;
+  background: rgba(45, 127, 249, 0.1);
+  border-radius: 9px;
+}
+.block-text {
+  font-size: 13px;
+  line-height: 1.75;
+  color: #2f343a;
+  word-break: break-word;
+}
+.block-empty {
+  color: #c0c4cc;
+}
+/* 逐条列表：序号用小圆标，条目之间留白，比整段文字好扫读 */
+.block-list {
+  margin: 0;
+  padding: 0 4px;
+  list-style: none;
+  counter-reset: block-item;
+}
+.block-list li {
+  position: relative;
+  padding-left: 32px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  line-height: 1.75;
+  color: #2f343a;
+  word-break: break-word;
+}
+.block-list li:last-child {
+  margin-bottom: 0;
+}
+/* 条目序号：浅蓝圆形徽标，配合大间距让每步独立成块 */
+.block-list li::before {
+  counter-increment: block-item;
+  content: counter(block-item);
+  position: absolute;
+  left: 0;
+  top: 1px;
+  width: 21px;
+  height: 21px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 21px;
+  text-align: center;
+  color: #2d7ff9;
+  background: #e6f0ff;
+  border-radius: 50%;
+}
+/* 窄屏回落为纵向堆叠 */
+@media (max-width: 1200px) {
+  .card-body {
+    grid-template-columns: 1fr;
+  }
+  .card-block {
+    max-height: none;
+  }
+}
+/* v-html 内容不受 scoped 约束，需 deep 才能收紧默认段落间距 */
+.card-body :deep(.block-text p) {
+  margin: 0 0 4px;
+}
+.card-body :deep(.block-text p:last-child) {
+  margin-bottom: 0;
+}
+.card-body :deep(.block-text ol),
+.card-body :deep(.block-text ul) {
+  margin: 2px 0;
+  padding-left: 20px;
+}
+.card-body :deep(.block-text li) {
+  margin-bottom: 2px;
+}
+.card-body :deep(.block-text table) {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.card-body :deep(.block-text th),
+.card-body :deep(.block-text td) {
+  border: 1px solid #ebeef5;
+  padding: 3px 6px;
+}
+.card-type {
+  font-size: 12px;
+  color: #a3a8ae;
+}
+.card-muted {
+  font-size: 12px;
+  color: #bcc0c5;
+}
+
+.card-meta {
+  display: grid;
+  /* 单列宽卡：四个字段排一行，窄屏回落到两列 */
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px 16px;
+  padding-top: 2px;
+}
+@media (max-width: 1100px) {
+  .card-meta {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.card-field {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.card-field b {
+  flex: none;
+  width: 40px;
+  color: #a3a8ae;
+  font-weight: 400;
+}
+.card-field em {
+  min-width: 0;
+  color: #464b52;
+  font-style: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.card-field .mini-tag {
+  margin-right: 4px;
+  border-radius: 4px;
+}
+
+.card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  border-top: 1px solid #f2f3f5;
+}
+.card-sub {
+  font-size: 12px;
+  color: #a8abb2;
+}
+.card-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+/* 操作按钮压到次要层级，hover 卡片时才显眼 */
+.card-actions .el-button {
+  margin-left: 0;
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 6px;
 }
 
 .filter-bar {
@@ -1694,9 +2325,22 @@ onMounted(async () => {
 }
 
 .pagination-container {
-  margin-top: 20px;
+  margin-top: 18px;
   display: flex;
   justify-content: center;
+}
+.pagination-container :deep(.el-pagination) {
+  font-size: 13px;
+}
+.pagination-container :deep(.el-pager li) {
+  min-width: 30px;
+  height: 30px;
+  line-height: 30px;
+  border-radius: 6px;
+  font-weight: 400;
+}
+.pagination-container :deep(.el-pager li.is-active) {
+  font-weight: 600;
 }
 
 .header-actions {

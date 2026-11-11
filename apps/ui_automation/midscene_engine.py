@@ -1293,6 +1293,14 @@ class MidsceneAppEngine:
         # 当前步骤恰好还能过，它就会一直挂在那儿，等到某个倒霉步骤才失败，
         # 报告里表现为"莫名其妙的失败"。开跑先清一次成本仅一次模型调用。
         if self.auto_dismiss_popup and self.popup_precheck:
+            # ⭐ 先用**零模型、零歧义**的方式处理 android 系统权限框：
+            # 权限框是冷启动最高频的弹窗，且它的按钮只有"允许/拒绝"两种可能，
+            # 完全不需要模型去猜。2026-11-02 实测：走模型路径时一次预检要 1 分钟
+            # 以上，而这里 dump 一次层级 + 点一下不到 2 秒。
+            try:
+                self._grant_permission_dialog_if_present()
+            except Exception as exc:  # noqa: BLE001
+                self._log('[弹窗] 系统权限框处理失败（不影响执行）: %s', exc)
             try:
                 n = dismiss_popups(self._popup_adapter())
                 if n:
@@ -1342,6 +1350,11 @@ class MidsceneAppEngine:
                 try_count += 1
                 self._log('[步骤 %d] 失败，检测是否为弹窗干扰（第 %d/%d 次重试）...',
                           idx + 1, try_count, limit)
+                # 系统权限框优先走零模型路径（快且不会点成"拒绝"）
+                try:
+                    self._grant_permission_dialog_if_present()
+                except Exception:  # noqa: BLE001
+                    pass
                 if dismiss_popups(self._popup_adapter()) == 0:
                     self._log('[步骤 %d] 未发现弹窗，不再重试', idx + 1)
                     break
@@ -1428,6 +1441,50 @@ class MidsceneAppEngine:
         """把本引擎的能力包成 popup_handler 需要的接口。"""
         page = self._page
         return _AndroidPopupAdapter(page, self._log)
+
+    #: android 系统权限框的"允许"类按钮文案（按命中顺序尝试）。
+    #: 覆盖 Android 12+ 的三选一（使用应用时 / 仅限这一次）与旧版（允许）。
+    PERMISSION_ALLOW_LABELS = (
+        '使用应用时', '仅限这一次', '允许', '始终允许', '仅在使用该应用时',
+        'Allow', 'While using the app', 'Only this time', 'ALLOW',
+    )
+
+    #: 系统权限框的判据：包名 + 这些文案同时出现。
+    _PERMISSION_PKG_MARKERS = ('com.android.permissioncontroller',
+                               'com.google.android.permissioncontroller',
+                               'com.android.packageinstaller')
+
+    def _grant_permission_dialog_if_present(self):
+        """若当前是 android 系统权限框，直接点"允许"。返回是否点了。
+
+        为什么单独做（不复用弹窗模型路径）：
+          权限框是**系统进程**弹出的，层级结构稳定、按钮文案固定，
+          用 dump 精确匹配即可，既快（~1s）又不会误点成"拒绝"。
+          模型路径在真机上曾出现答「跳过 1」「立即登录」这类错位回答。
+        """
+        if self._page is None:
+            return False
+        try:
+            xml = str(self._page.run_adb_shell(
+                'uiautomator dump /sdcard/_ms_perm.xml >/dev/null 2>&1; '
+                'cat /sdcard/_ms_perm.xml') or '')
+        except Exception as exc:  # noqa: BLE001
+            self._log('[权限] 读取界面层级失败（跳过预授权）: %s', exc)
+            return False
+        if '<node' not in xml:
+            return False
+        if not any(p in xml for p in self._PERMISSION_PKG_MARKERS):
+            return False
+        self._log('[权限] 检测到系统权限框')
+        for label in self.PERMISSION_ALLOW_LABELS:
+            if label not in xml:
+                continue
+            if self._popup_adapter().tap_text(label):
+                self._log('[权限] 已点「%s」授予权限', label)
+                time.sleep(0.5)
+                return True
+        self._log('[权限] 权限框里没找到"允许"类按钮，留给弹窗处理')
+        return False
 
     @staticmethod
     def _step_has_content(step: dict) -> bool:
@@ -2030,6 +2087,72 @@ class MidsceneAppEngine:
         """
         return bool(sig_before) and sig_before == sig_after
 
+    #: 目标描述里出现这些词 ⇒ 目标是一个**区域/容器**（心情区域、表情面板…），
+    #: 点击它得到的是"展开/收起"，不是跳页。
+    #:
+    #: 为什么要区分（2026-11-03 实测，日记页「点击任意一个心情图标」）：
+    #:   心情区域初始是**收起**的。ai_tap 点到的是容器或「记录心情」文字，
+    #:   面板一展开 ⇒ 画面变化远超 2%、文字也变了 ⇒ 原判据判"生效"，
+    #:   报告显示 passed，而用户看到的是"根本没点上"。
+    #:
+    #: 用户给出的正确操作序列（2026-11-03）：
+    #:   **点击后会有展开区域 → 再点击展开区域里的位置**。
+    #:   所以判据不是"图标变选中"，而是"展开区域确实出现了"，
+    #:   出现了就说明这一次点击有效，后续步骤再点区域内的具体位置。
+    _EXPAND_TARGET_WORDS = (
+        '任意', '任一', '随便', '一个', '某个', '其中', '之一',
+        '图标', '表情', '心情', '面板', '展开区域', '展开的', '区域',
+        '标签', '颜色', '头像', '评分', '星级',
+    )
+
+    def _target_is_expandable(self, target):
+        """目标是否为"点了会展开/收起的区域"（换页不是预期结果）。"""
+        t = str(target or '')
+        return any(w in t for w in self._EXPAND_TARGET_WORDS)
+
+    #: 展开区域里常出现的确认类文字。它们从无到有地出现，
+    #: 就是"这块区域刚刚被展开"的最直接证据。
+    _EXPAND_CONFIRM_WORDS = (
+        '取消', '确定', '完成', '保存', '删除', '更多', '自定义', '添加',
+    )
+
+    def _confirm_expanded(self, target, sig_before, sig_after, shot_ratio):
+        """确认点击后确实出现了"展开区域"。
+
+        判据（任一成立即通过）：
+          ① 文字集合**大幅变化**（未变占比 < 阈值）—— 展开面板属于典型的大改版；
+          ② 文字集合新增 ≥2 项（心情图标名/选项名从无到有）；
+          ③ 新增项里含确认类文字（取消/确定/完成…）—— 展开区域的标志；
+          ④ 文字指纹疑似缓存未刷新时，退看截图差异（≥ 阈值）。
+
+        ⚠️ 之所以不再要求"图标进入选中态"（用户 2026-11-03 说明）：
+           这类自绘心情图标的 a11y 层级里通常**没有** checked/selected，
+           按选中态判会把"点对了"也判成失败。用户的预期是"展开区域出现即可"。
+        """
+        have_sig = bool(sig_before and sig_after)
+        if have_sig:
+            ratio = self._stable_ratio(sig_before, sig_after)
+            if ratio < self.PAGE_SIGNATURE_SAME_MIN:
+                self._log('[点击校验] 页面文字仅保留 %.0f%%，展开区域已出现',
+                          ratio * 100)
+                return True
+            added = {x for x in (sig_after - sig_before) if x and len(x) <= 12}
+            if len(added) >= 2:
+                self._log('[点击校验] 新增 %d 项文字（%s），展开区域已出现',
+                          len(added), '、'.join(sorted(added))[:80])
+                return True
+            if added & set(self._EXPAND_CONFIRM_WORDS):
+                self._log('[点击校验] 出现确认类文字（%s），展开区域已出现',
+                          '、'.join(sorted(added & set(self._EXPAND_CONFIRM_WORDS))))
+                return True
+        # 文字层级可能没刷新（dump 缓存），退看截图
+        if self._shot_is_stale(sig_before, sig_after) or not have_sig:
+            if shot_ratio >= self.TAP_EFFECT_MIN_DIFF:
+                self._log('[点击校验] 文字层级未反映变化，但画面变化 %.1f%%，'
+                          '判定展开区域已出现', shot_ratio * 100)
+                return True
+        return False
+
     def _verify_tap_effect(self, step, before, target, idx):
         """点击后校验页面是否**真的换了**；没换则重试一次。
 
@@ -2072,6 +2195,25 @@ class MidsceneAppEngine:
             self._log('[点击校验] 文字层级疑似缓存未刷新，改看截图：画面变化 %.1f%%'
                       '（≥%.0f%%）判定点击生效',
                       shot_ratio * 100, self.TAP_EFFECT_MIN_DIFF * 100)
+            self._entry_cache = None
+            return
+
+        # ⭐ 目标本身是"点了会展开/收起的区域"：换页不是预期结果，
+        # 必须确认**展开区域真的出现了**，否则不能算通过。
+        #
+        # 2026-11-03 实测（日记页「点击任意一个心情图标」）：
+        #   心情区域初始收起，ai_tap 点到容器/「记录心情」文字后一旦展开，
+        #   画面变化就远超 2%、文字也变了 —— 原先的判据据此判"生效"。
+        #   用户确认的正确序列是：**点击后会有展开区域，再点击展开区域里的位置**。
+        #   所以判据改为"展开区域是否出现"，而不是"图标是否进入选中态"
+        #   （这类自绘图标的 a11y 里通常没有 checked/selected，按选中态判会误杀）。
+        if self._target_is_expandable(target):
+            if not self._confirm_expanded(target, before_sig, after_sig, shot_ratio):
+                raise AssertionError(
+                    '点击「%s」后未观察到展开区域（画面与文字均无明显变化），'
+                    '判定点击未生效。若该控件需要先展开才能选择，'
+                    '请把步骤写成「展开XX面板，然后点击其中任意一个…」'
+                    % target)
             self._entry_cache = None
             return
 
@@ -2475,6 +2617,88 @@ class _AndroidPopupAdapter(PopupAdapter):
 
     def tap(self, target: str) -> None:
         self._page.ai_tap(target)
+
+    def tap_text(self, text: str) -> bool:
+        """按屏幕上的确切文字点击（dump 层级里精确比对 text / content-desc）。
+
+        为什么不用 `ai_tap`（2026-11-02 真机实测）：
+          ① 视觉点击一次要 20~60 秒，弹窗预检 + 每步重试会成倍放大耗时；
+          ② 模型会把「登录万年历」弹窗里的**取消**读成"接受"，转而点「立即登录」，
+             用例后面全跑在登录页上 —— 语义层面的错，改提示词只能降低概率。
+        这里完全不调模型：在 a11y 层级里找文字**完全相等**的节点，取其可点父节点
+        的 bounds 中心直接 `input tap`。找不到就返回 False，让调用方退回视觉点击。
+
+        ⚠️ 只做精确比对、不做模糊包含：模糊匹配会在「登录」上命中「立即登录」，
+        那正是要避免的事。
+        """
+        try:
+            xml = str(self._page.run_adb_shell(
+                'uiautomator dump /sdcard/_ms_popup.xml >/dev/null 2>&1; '
+                'cat /sdcard/_ms_popup.xml') or '')
+        except Exception as exc:  # noqa: BLE001
+            self.log('[弹窗] 读取界面层级失败（退回视觉点击）: %s' % exc)
+            return False
+        if '<node' not in xml:
+            return False
+
+        want = str(text or '').strip()
+        if not want:
+            return False
+
+        def _bounds(tag):
+            m = re.search(r'bounds="\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]"', tag)
+            if not m:
+                return None
+            x1, y1, x2, y2 = (int(m.group(i)) for i in range(1, 5))
+            if x2 - x1 <= 1 or y2 - y1 <= 1:
+                return None  # [0,0][0,0] 这类虚拟节点，点了也没用
+            return ((x1 + x2) // 2, (y1 + y2) // 2)
+
+        node_re = re.compile(r'<node\b[^>]*>')
+        nodes = list(node_re.finditer(xml))
+
+        # ① 先找文字完全相等的节点，用它的 bounds
+        for m in nodes:
+            tag = m.group(0)
+            t = re.search(r'(?:^|\s)text="([^"]*)"', tag)
+            d = re.search(r'(?:^|\s)content-desc="([^"]*)"', tag)
+            if want not in ((t.group(1) if t else ''), (d.group(1) if d else '')):
+                continue
+            pt = _bounds(tag)
+            if pt:
+                self._log_func('[弹窗] 文字「%s」命中节点 (%d, %d)', want, pt[0], pt[1])
+                try:
+                    self._page.run_adb_shell('input tap %d %d' % pt)
+                    return True
+                except Exception as exc:  # noqa: BLE001
+                    self.log('[弹窗] adb 点击失败: %s' % exc)
+                    return False
+
+        # ② 文字节点自身没有有效 bounds（常见的虚拟布局），往上找父节点：
+        #    用前后两条 <node 之间的 nesting 关系粗略回溯最近的可点祖先。
+        #    这里只做一层"最近带 bounds 且 clickable=true 的祖先"，够覆盖弹窗按钮。
+        for m in nodes:
+            tag = m.group(0)
+            t = re.search(r'(?:^|\s)text="([^"]*)"', tag)
+            d = re.search(r'(?:^|\s)content-desc="([^"]*)"', tag)
+            if want not in ((t.group(1) if t else ''), (d.group(1) if d else '')):
+                continue
+            head = xml[:m.start()]
+            ancestors = re.findall(r'<node\b[^>]*>', head)
+            for anc in reversed(ancestors):
+                if 'clickable="true"' not in anc:
+                    continue
+                pt = _bounds(anc)
+                if not pt:
+                    continue
+                self._log_func('[弹窗] 文字「%s」借父节点点击 (%d, %d)', want, pt[0], pt[1])
+                try:
+                    self._page.run_adb_shell('input tap %d %d' % pt)
+                    return True
+                except Exception as exc:  # noqa: BLE001
+                    self.log('[弹窗] adb 点击失败: %s' % exc)
+                    return False
+        return False
 
     def log(self, msg: str) -> None:
         self._log_func('%s', msg)

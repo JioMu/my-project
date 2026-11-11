@@ -65,6 +65,13 @@ if (-not (Test-Path $dumpDir)) { New-Item -ItemType Directory -Path $dumpDir -Fo
 docker cp testhub-mysql:/tmp/testhub_dump.sql (Join-Path $dumpDir "testhub_$Stamp.sql")
 Say "db dump -> $dumpDir\testhub_$Stamp.sql"
 
+Say '=== STEP 1.5 sync host code into /app (survives nothing; bake happens in STEP 2) ==='
+# The image is built from the HOST worktree (Dockerfile.backend: COPY . .), so any
+# code that currently lives ONLY inside the container (docker cp hot-fix) would be
+# silently lost by the rebuild. Optionally run scripts/_prod_bake.sync.ps1 first if
+# you need to copy container-only changes back to the host before this point.
+Say 'host is the source of truth for STEP 2; verify with: git status --short'
+
 Say '=== STEP 2 docker compose build backend (40-70 min, no --no-cache) ==='
 # 2026-10-10: build output MUST be captured. Previously it went to the (hidden) console only,
 # so two consecutive pip failures left us with no error text at all and cost ~2h of guessing.
@@ -135,26 +142,25 @@ $Expect = @{
   '/app/apps/requirement_analysis/independent_skill/prompts/tester.md'     = 'ABFDD8548E5B852C3143F844EED62764';
   '/app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md' = 'FAF9D37D6361CD1A7C1F9089A40A433E';
   '/app/apps/zentao/services.py'                                          = '7FBAD39D20E81331E890FCC63F3A5E61';
-  '/app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md' = '2A183D64FEE02FE01ECB6C3C3A877759';
+  # 2026-11-04: p2 强制 feature_ref/api_ref + p7 强制 ref 并集透传/category 保真（commit 0ae6a19）
+  '/app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md' = 'B042C48309C0BA93DAB731A0EC097F53';
   '/app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md'      = '6596C958C826F7003F7003197AB8B428';
-  '/app/apps/requirement_analysis/modao_skill/prompts/p7_merge_dedup.md' = 'AF4D46C137E031D8EB6B6EB063E7A438';
-  # 2026-10-15: p0 底模降噪（第 23/24 条）+ p2 展示型/回归型/埋点型测试点（第 11/12 条）
-  '/app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md' = '63CD0947D95E4831C247418C520C0708';
-  # 2026-10-14: 用例合并采纳页补列 + 采纳挂版本/子孙模块筛选 + 采纳覆盖更新 + adopted_keys
-  # 2026-10-14 hotfix: _adopted_entry_keys/_in_lib 去掉 get_or_create（GET detail 1048 created_by_id 不能为 null）
-  # 2026-10-14 晚: 自愈闭环人工触发（adoption-diff / backfill-kb）+ 人工补充采纳 source='manual'
-  '/app/apps/requirement_analysis/modao_views.py'                         = 'CA155DA9D8CECD70F869FE367E0FC279';
-  '/app/apps/requirement_analysis/serializers.py'                         = '8935EEEDB95043128F5815793ACEE9C2';
-  # 2026-10-15: 跨画布澄清归属隔离（run_clarify 写回按画布过滤）+ 提取后默认不全选
-  # 2026-10-15: _llm 默认超时 300->600（analyzer=DeepSeek deepseek-chat 大原型偶发慢响应误杀）
-  '/app/apps/requirement_analysis/modao_workflow.py'                      = 'A50E091707A0E4A392F55A01F06E7E9F';
-  # 2026-10-14 晚: 自愈闭环第 3/4 环（diff_ai_vs_adopted / _adoption_kb_items / backfill_kb_from_adoption）
-  # 2026-10-15: call_openai_compatible_api 增加有界重试（供应商瞬断/超时/5xx/429 自动恢复；硬错误与取消不重试）
-  '/app/apps/requirement_analysis/ai_model_service.py'                    = '14C379C1748695726545DFCA62178362';
+  '/app/apps/requirement_analysis/modao_skill/prompts/p7_merge_dedup.md' = '9EB29E57F4E624BE029EECC35ADBB9C1';
+  # 2026-11-05: p0 硬约束 29/30/31（模块=主画布+多状态、状态差异各自成 key_features、画布边界不可越界）
+  '/app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md' = '809B3460D76C2197CC32A6A91F1BABA4';
+  # 2026-11-05: _adopted_entry_keys 改两次批量查询 + _mname_cache（实测 1152 次 SQL/3.58s -> 54 次/0.198s）
+  '/app/apps/requirement_analysis/modao_views.py'                         = '6D4B6B31B7F069ECDF751034E90A6C27';
+  '/app/apps/requirement_analysis/serializers.py'                         = '3FBDA2469C2CB1889D0C8AAECE9ECF94';
+  # 2026-11-05: 阶段边界/逐画布循环 close_old_connections + _page_has_requirement_annotation
+  '/app/apps/requirement_analysis/modao_workflow.py'                      = 'F407DB9F17BA551B31DAF48AEA35AA41';
+  '/app/apps/requirement_analysis/ai_model_service.py'                    = '7D62F51CBF119B2AE44E99467FA572F8';
   # 2026-10-15: PageObjectViewSet.filterset_fields 去掉不存在的 execution_mode（Swagger /api/schema/ 500）
-  '/app/apps/ui_automation/views.py'                                      = 'E2DAF94F92ACF8D61911AC4F59C9BF86'
+  '/app/apps/ui_automation/views.py'                                      = '61C714CE1058F16EADF4ACA05A900AD2';
+  # 2026-11-05: 用例生成/重新评审/用例审计 4 处 threading.Thread 套 _thread_with_conn_cleanup
+  #             + save_stream_buffer 加 finally close_old_connections（MySQL 1040 Too many connections）
+  '/app/apps/requirement_analysis/views.py'                               = '211BE5170CA7F1B10923F9064E95D507'
 }
-$md5Raw = docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py /app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p7_merge_dedup.md /app/apps/requirement_analysis/modao_views.py /app/apps/requirement_analysis/serializers.py /app/apps/requirement_analysis/modao_workflow.py /app/apps/requirement_analysis/ai_model_service.py /app/apps/ui_automation/views.py
+$md5Raw = docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py /app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p7_merge_dedup.md /app/apps/requirement_analysis/modao_views.py /app/apps/requirement_analysis/serializers.py /app/apps/requirement_analysis/modao_workflow.py /app/apps/requirement_analysis/ai_model_service.py /app/apps/ui_automation/views.py /app/apps/requirement_analysis/views.py
 $md5Bad = 0
 foreach ($line in $md5Raw) {
   $parts = ($line -split '\s+') | Where-Object { $_ -ne '' }
@@ -175,6 +181,10 @@ Say '--- 2026-10-15 anchor (p0 底模降噪条款在位；ui_automation 由 STEP
 # NOTE: do NOT use `grep -c execution_mode` here -- that string legitimately appears
 # (serializer fields etc.). The real regression guard is the STEP4 schema check.
 docker exec testhub-backend grep -c ui_screen /app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md
+Say '--- 2026-11-05 anchors (connection cleanup really present in the image) ---'
+# Expect >=1 each; 0 means the fix was docker-cp'ed but never baked into the image.
+docker exec testhub-backend grep -c _thread_with_conn_cleanup /app/apps/requirement_analysis/views.py
+docker exec testhub-backend grep -c _mname_cache /app/apps/requirement_analysis/modao_views.py
 # 2026-10-14: was hardcoded to 'all 5 md5 match' and silently went stale when two
 # modao prompts were added. Derive the count from the table so it cannot drift.
 Say "all $($Expect.Count) md5 match -> prompts + zentao/services.py are baked into the image"
