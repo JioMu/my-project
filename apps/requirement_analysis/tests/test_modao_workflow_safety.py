@@ -269,4 +269,141 @@ class ModaoQualityGateAndStateTests(SimpleTestCase):
         self.assertEqual(tps[0]['category'], 'main_flow')
         self.assertEqual(res['blocking'], [])
 
+    def test_dual_extract_one_preserves_batch_order_under_concurrency(self):
+        """验证 _dual_extract_one 在后序批次先返回时，仍严格按原批次顺序输出且并发执行。"""
+        import asyncio
+        from apps.requirement_analysis.modao_extractor import ModaoExtractor
+
+        extractor = ModaoExtractor(run_id='test_order')
+        # 构造 4 个超过 12000 字符阈值的块，迫使切分为 4 个独立批次
+        blocks = [
+            f"### 页面{i}\n" + (f"内容{i}_" * 1600)
+            for i in range(1, 5)
+        ]
+
+        active_calls = 0
+        max_active_calls = 0
+
+        class FakeAIMService:
+            @staticmethod
+            async def call_openai_compatible_api(config, messages, max_tokens=16000):
+                nonlocal active_calls, max_active_calls
+                active_calls += 1
+                if active_calls > max_active_calls:
+                    max_active_calls = active_calls
+                user_msg = messages[-1]['content']
+                # 让第 1 批最慢返回，第 4 批最快返回，测试乱序完成时的槽位保序
+                if '批次 1/4' in user_msg:
+                    await asyncio.sleep(0.08)
+                    idx = 1
+                elif '批次 2/4' in user_msg:
+                    await asyncio.sleep(0.05)
+                    idx = 2
+                elif '批次 3/4' in user_msg:
+                    await asyncio.sleep(0.03)
+                    idx = 3
+                else:
+                    await asyncio.sleep(0.01)
+                    idx = 4
+                active_calls -= 1
+                return {
+                    'choices': [{
+                        'message': {
+                            'content': f'[{{"source_pages":["页面{idx}"],"module":"M{idx}","feature":"F{idx}","interaction":"I","evidence":"A"}}]'
+                        }
+                    }]
+                }
+
+        reqs = asyncio.run(extractor._dual_extract_one(FakeAIMService, object(), blocks))
+        self.assertEqual([r['feature'] for r in reqs], ['F1', 'F2', 'F3', 'F4'])
+        self.assertGreater(max_active_calls, 1, "应当并发执行多个批次而非纯串行")
+
+    def test_dual_fuse_splits_large_requirements_into_batches(self):
+        """验证 _dual_fuse 在两路需求总条数超过阈值时自动分批融合，避免单次超长截断。"""
+        import asyncio
+        import json
+        from apps.requirement_analysis.modao_extractor import ModaoExtractor
+
+        extractor = ModaoExtractor(run_id='test_fuse_batch')
+        dom_reqs = [
+            {'source_pages': [f'页面{i % 10}'], 'module': f'M{i % 10}', 'feature': f'DOM_{i}', 'interaction': 'x', 'evidence': 'A'}
+            for i in range(60)
+        ]
+        vis_reqs = [
+            {'source_pages': [f'页面{i % 10}'], 'module': f'M{i % 10}', 'feature': f'VIS_{i}', 'interaction': 'y', 'evidence': 'B'}
+            for i in range(90)
+        ]
+
+        call_count = 0
+
+        class FakeAIMService:
+            @staticmethod
+            async def call_openai_compatible_api(config, messages, max_tokens=16000):
+                nonlocal call_count
+                call_count += 1
+                user_msg = messages[-1]['content']
+                # 解析传入该批次的 DOM 与 VIS 条数，返回合并后的模拟融合结果
+                m_idx = call_count
+                return {
+                    'choices': [{
+                        'message': {
+                            'content': json.dumps([
+                                {'source_pages': [f'批次{m_idx}'], 'module': 'M', 'feature': f'FUSED_{m_idx}',
+                                 'interaction': 'z', 'evidence': 'A', 'sources': ['dom', 'vision'], 'confidence': 'high'}
+                            ], ensure_ascii=False)
+                        }
+                    }]
+                }
+
+        fused = asyncio.run(extractor._dual_fuse(FakeAIMService, object(), dom_reqs, vis_reqs, 5000))
+        self.assertGreater(call_count, 1, "超过 100 条需求时应拆分为多个批次融合")
+        self.assertEqual(len(fused), call_count)
+
+    def test_dedup_state_vision_text_removes_duplicate_base_lines(self):
+        """验证子状态视觉文本拼接时，自动剔除已在主图视觉文本中出现过的重复行。"""
+        from apps.requirement_analysis.modao_extractor import _dedup_state_vision_text
+
+        base_text = "顶部导航栏\n右侧固定PRD说明第1行\n右侧固定PRD说明第2行\n默认态按钮文案"
+        state_text = "顶部导航栏\n右侧固定PRD说明第1行\n右侧固定PRD说明第2行\n弹窗标题：确认删除？\n确认 取消"
+        diff_only = _dedup_state_vision_text(base_text, state_text)
+        self.assertIn("弹窗标题：确认删除？", diff_only)
+        self.assertIn("确认 取消", diff_only)
+        self.assertNotIn("右侧固定PRD说明第1行", diff_only)
+        self.assertNotIn("顶部导航栏", diff_only)
+
+    def test_h5_page_dedup_keeps_distinct_spec_pages_with_same_screen(self):
+        """验证同画面去重逻辑：手机屏幕文本相同时，若需求说明(dom_text)不同，绝不误并。"""
+        import hashlib
+        pages = [
+            {'page_no': 1, '_src_id': 'p1', 'page_name': '首页·每日花瓣领取', 'dom_text': '每日花瓣领取说明规则...'},
+            {'page_no': 2, '_src_id': 'p2', 'page_name': '首页角色分类设置', 'dom_text': '首页推荐分类修改规则...'},
+            {'page_no': 3, '_src_id': 'p3', 'page_name': '个人中心', 'dom_text': '通用资料'},
+            {'page_no': 4, '_src_id': 'p4', 'page_name': '创作者主页', 'dom_text': '通用资料'},
+        ]
+        screen_texts = {
+            'p1': 'Hana Koi 首页 每日免费花瓣 全部 官方精选 都市',
+            'p2': 'Hana Koi 首页 每日免费花瓣 全部 官方精选 都市',
+            'p3': '个人中心 我的作品 关注 粉丝 设置',
+            'p4': '个人中心 我的作品 关注 粉丝 设置',
+        }
+        _sig_map = {}
+        for pg in pages:
+            _pid = str(pg.get('_src_id') or '')
+            _stxt = (screen_texts.get(_pid) or '').strip()
+            _dtxt = (pg.get('dom_text') or '').strip()
+            _comb = f"{_stxt}\n---\n{_dtxt}"
+            _sig = hashlib.sha256(_comb.encode('utf-8')).hexdigest()
+            _sig_map.setdefault(_sig, []).append(pg)
+
+        sig_p1 = hashlib.sha256(f"{screen_texts['p1']}\n---\n{pages[0]['dom_text']}".encode('utf-8')).hexdigest()
+        sig_p2 = hashlib.sha256(f"{screen_texts['p2']}\n---\n{pages[1]['dom_text']}".encode('utf-8')).hexdigest()
+        self.assertNotEqual(sig_p1, sig_p2)
+        self.assertEqual(len(_sig_map[sig_p1]), 1)
+        self.assertEqual(len(_sig_map[sig_p2]), 1)
+
+        sig_p3 = hashlib.sha256(f"{screen_texts['p3']}\n---\n{pages[2]['dom_text']}".encode('utf-8')).hexdigest()
+        self.assertEqual(len(_sig_map[sig_p3]), 2)
+
+
+
 
